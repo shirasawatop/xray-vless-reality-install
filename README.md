@@ -64,7 +64,7 @@ bash /root/xray-vless-reality-install.sh
 | 4 | 是否开启 DDNS 自动更换 IP | `n` | 开启后生成 `/var/xray/ddns_check.sh` 与 `ddns.config`（**定时需自行挂 cron**） |
 | 5 | 是否开启 MTU 调整 | `n` | 接口默认 `eth0`、值默认 `1390`，以 `ExecStartPre=ip link set …` 写入 unit |
 | 6 | 监听 IP / 端口 | `0.0.0.0` / `443` | 443 需 `CAP_NET_BIND_SERVICE`（脚本已处理） |
-| 6a | **REALITY 专属**：伪装域名 | **`www.fastly.com`** | 需**支持 TLS1.3**（通常还要 HTTP/2）的境外站点，常用 **`www.amd.com`**；`dest=域名:443`、`serverNames=[域名]`（选法见「例 1」下方） |
+| 6a | **REALITY 专属**：伪装域名 | **`www.fastly.com`** | 需**支持 TLS1.3** 的境外站点，常用 **`tesla.com`**；`dest=域名:443`、`serverNames=[域名]`（选法见「例 1」下方） |
 | 6b | **REALITY 专属**：指纹 `fp` | `chrome` | 可选 chrome / firefox / safari / ios / edge |
 | 6c | **Encryption 专属**：密钥模式 | `mlkem768` | `mlkem768`（抗量子，推荐）/ `x25519`（传统） |
 | 6d | **Encryption 专属**：外观 | `native` | `native` / `xorpub` / `random`（越靠后越隐蔽） |
@@ -102,7 +102,7 @@ bash /root/xray.sh
 | `开启 MTU 调整？(y/n):` | `n` | 隧道环境可改 `y` + MTU `1390` |
 | `监听IP (默认0.0.0.0):` | 回车 | 默认即可（亦可用 `::` 走双栈） |
 | `监听端口 (默认443):` | 回车 | 443 需要 `CAP_NET_BIND_SERVICE`（脚本已处理） |
-| `伪装域名 (默认www.fastly.com):` | 回车 或 **`www.amd.com`** | 回车即用默认 `www.fastly.com`；也可填你自测可用的站点（见下方说明） |
+| `伪装域名 (默认www.fastly.com):` | 回车 或 **`tesla.com`** | 回车即用默认 `www.fastly.com`；也可填你自测可用的站点（见下方说明） |
 | `选择 (默认 chrome):` | 回车 | 客户端指纹 `fp` |
 | `选择落地方式:` | `1` | 1 = 直接落地 |
 
@@ -112,7 +112,8 @@ bash /root/xray.sh
 >
 > - 硬性条件：必须支持 **TLS1.3**；建议同时支持 **HTTP/2**（ALPN `h2`）。
 > - 建议：选**境外**、**非自有**、内容稳定的站点；若域名会 301/302，**直接填跳转后的最终域名**。
-> - 本项目的取值：脚本默认 **`www.fastly.com`**（实测 TLS1.3 + h2 + HTTP 200，握手约 20 ms）；另一个常用选择是 **`www.amd.com`**。
+> - 本项目的取值：脚本默认 **`www.fastly.com`**（实测 TLS1.3 + h2 + HTTP 200、握手约 20 ms）；历史默认值 **`tesla.com`** 也长期在用。
+> - 判据只看 **TLS 握手**：REALITY 是把 ClientHello 透明转发给 `dest`、用它的真实证书完成握手，**HTTP 层返回什么都不影响可用性**（例如 `tesla.com` 对数据中心 IP 返 403，但 TLS1.3 握手正常，因此完全可用）。h2 属于"伪装更像"的加分项，不是硬性要求。
 > - ⚠️ 请**从你的 VPS 上**自测（REALITY 是**服务端去连 `dest`**，从手机测没有意义）；且下列检查只是**必要条件、不是充分条件**，最终以客户端能否连通为准：
 >
 > ```bash
@@ -307,8 +308,9 @@ xray.delxray            # 需输入 yes 确认；会停止服务、禁用开机�
 
 **v1.0.2（2026-09-11）**
 
-- **默认伪装域名**由 `tesla.com` 改为 **`www.fastly.com`** —— 实测（从服务端发起）：TLS1.3 + HTTP/2 + HTTP 200、握手约 20 ms；同一环境下 `tesla.com` 返回 403。
-- README 的伪装域名示例同步更新为 `www.amd.com`；无其它功能变更。
+- **默认伪装域名**由 `tesla.com` 改为 **`www.fastly.com`** —— 实测（从服务端发起）：TLS1.3 + HTTP/2 + HTTP 200、握手约 20 ms。
+- `tesla.com` 仍是**可用**选项：它的 HTTP 层对数据中心 IP 返 403，但 TLS1.3 握手正常 —— REALITY 只用握手，故不受影响（此前把 403 当作"不可用"的表述已更正）。
+- README 的伪装域名示例与判据说明同步更新；无其它功能变更。
 
 **v1.0.1（2026-09-11）**
 
