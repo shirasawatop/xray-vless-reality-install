@@ -1,0 +1,30 @@
+# ---- 操作系统 / 编辑器 ----
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ---- 临时 / 备份 ----
+*.bak
+*.tmp
+*.old
+*.log
+
+# ---- 本地私有资料（安全网）----
+# 若在含这些文件的目录中操作本仓库，它们不会被提交；
+# 公开仓库只应包含：xray-vless-reality-install.sh、README.md、LICENSE、.gitignore
+VPS安全加固部署手册.md
+sadidc-*.md
+sadidc-*.txt
+*-nftables.conf
+*-xray-config.json
+*-xray_service.service
+*-xrayinit
+*-cron-autoban.txt
+*-fail2ban-jail.local
+*_vps.txt
+zane_vps
+zane_vps.pub
+autoban-nft.sh
+.operit/
+.backup/
