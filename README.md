@@ -74,6 +74,118 @@ bash /root/xray-vless-reality-install.sh
 
 > 小贴士：`apt-get install -y whiptail` 可获得对话框式交互，避免长选项敲错。
 
+## 用法示例
+
+> 下例中的提示文字与脚本实际输出一致；**直接回车 = 采用默认值**。
+
+### 例 1：全新 VPS 部署 REALITY（最短路径）
+
+```bash
+# 0) 准备（Debian 12/13，root）
+apt-get update && apt-get install -y wget openssl unzip
+apt-get install -y whiptail        # 可选：获得对话框式交互
+
+# 1) 下载并运行
+wget -O /root/xray.sh https://raw.githubusercontent.com/shirasawatop/xray-vless-reality-install/main/xray-vless-reality-install.sh
+bash /root/xray.sh
+```
+
+交互应答（只有前两项需要动手，其余回车即可）：
+
+| 提示 | 输入 | 说明 |
+|---|---|---|
+| `请选择协议:` → `请输入 (1/2):` | `1` | 1 = REALITY |
+| `是否优先使用 IPv6 出口？(y/n, 默认 y):` | 回车 | **空 = 是**；只填 IPv4 也不影响 |
+| `请选择IPv4出口地址:` | `1` | 1 = 使用检测到的地址 |
+| `请选择IPv6出口地址:` | `3` | 3 = 不使用 IPv6 出口（无 IPv6 时选此项） |
+| `开启 DDNS 自动更换 IP？(y/n):` | 回车 | 空 = 否 |
+| `开启 MTU 调整？(y/n):` | `n` | 隧道环境可改 `y` + MTU `1390` |
+| `监听IP (默认0.0.0.0):` | 回车 | 默认即可（亦可用 `::` 走双栈） |
+| `监听端口 (默认443):` | 回车 | 443 需要 `CAP_NET_BIND_SERVICE`（脚本已处理） |
+| `伪装域名 (默认tesla.com):` | 回车 或 `www.microsoft.com` | 选**支持 TLS1.3 的境外站点** |
+| `选择 (默认 chrome):` | 回车 | 客户端指纹 `fp` |
+| `选择落地方式:` | `1` | 1 = 直接落地 |
+
+结束时脚本会打印：`[✓]` 四项自检 + **IPv4 订阅链接** + 管理命令清单。
+
+### 例 2：部署 VLESS Encryption（抗量子）
+
+同例 1，但协议选 `2`，并多出 4 个提问：
+
+| 提示 | 推荐输入 | 说明 |
+|---|---|---|
+| 密钥模式 | `1` | `mlkem768`（抗量子）；`2` = `x25519` |
+| 外观 | `1` | `native` 性能最好；`xorpub` / `random` 更隐蔽 |
+| RTT | `1` | `0rtt` 更快；`2` = `1rtt` 更安全 |
+| `Ticket 时长秒数（默认600，仅0rtt模式生效）:` | 回车 | 空 = `600s` |
+
+输出的链接形如 `vless://<uuid>@<ip>:<port>?encryption=mlkem768x25519plus.native.0rtt.<客户端密钥>&…`。
+
+### 例 3：socks5 落地 + DDNS + MTU（进阶）
+
+落地方式选 `2`，随后填写上游 socks5 的 `IP / 端口 / 用户 / 密码`；DDNS 与 MTU 均答 `y`。DDNS 会生成
+`/var/xray/ddns_check.sh` 与 `/var/xray/ddns.config`（**定时任务需自行添加**）：
+
+```bash
+# 每 5 分钟检查一次出口 IP 是否失效（示例）
+echo '*/5 * * * * root /var/xray/ddns_check.sh >/dev/null 2>&1' > /etc/cron.d/xray-ddns
+```
+
+### 例 4：日常运维
+
+```bash
+xray.status                 # 服务状态 + 端口监听 + 两个进程
+xray.log -f                 # 实时日志（透传 journalctl 参数）
+xray.restart                # 重启服务
+xray.chaguuid               # 更换客户端 UUID（会打印新的订阅链接）
+```
+
+> ⚠️ `xray.chaguuid` 换 UUID 后**所有旧客户端立即失效**，需用新链接更新客户端；命令内部会先用
+> 「白名单 / 长度 / 与 config.json 一致性 / 元字符转义」四重校验，异常时拒绝执行。
+
+### 例 5：手工调整（不重跑脚本）
+
+```bash
+cp -a /var/xray/config.json /root/config.json.bak-$(date +%F)   # 先备份
+vim /var/xray/config.json                                       # 改端口 / 加客户端等
+/var/xray/xray -test -c /var/xray/config.json                   # 关键：语法与语义校验，期望 "Configuration OK."
+xray.restart
+```
+
+要点：
+
+- 配置文件为 `root:xrayuser 640`，`sed -i` 会保留该归属（已验证），无需事后修权限；
+- **REALITY 加客户端**：复制 `inbounds[].settings.clients` 里的一条，换一个新的 `id`（`/var/xray/xray uuid` 生成）即可 —— `pbk`/`sid`/`sni` 不变，新链接仅 `uuid` 不同；
+- **Encryption 换密钥对**：用 `/var/xray/xray vlessenc` 生成新的 decryption/encryption 对，服务端改 `decryption`，客户端用对应的 `encryption` 串；
+- 多个设备**共用同一 UUID** 是最省事的做法（本脚本默认形态）。
+
+### 例 6：客户端核对（REALITY）
+
+链接里的每个参数都能在服务端对上号，排障时按此核对：
+
+| 链接参数 | 含义 | 服务端来源 |
+|---|---|---|
+| `<uuid>` | 客户端 ID | `config.json` 的 `"id"`（= `/var/xray/uuid.txt`） |
+| `sni` / `host` | 伪装域名 | `realitySettings.serverNames[0]` |
+| `pbk` | REALITY 公钥 | 由 `privateKey` 派生：`/var/xray/xray x25519 -i <privateKey>` |
+| `sid` | shortId | `realitySettings.shortIds[0]` |
+| `fp` | 客户端指纹 | 安装时所选（默认 `chrome`） |
+
+### 例 7：更新脚本本体 / 卸载重装
+
+```bash
+# 更新脚本文件本身：只影响「下次全新安装」，不动已在跑的实例
+wget -O /root/xray.sh https://raw.githubusercontent.com/shirasawatop/xray-vless-reality-install/main/xray-vless-reality-install.sh
+
+# 备份 → 卸载 →（需要时）重装
+cp -a /var/xray /root/xray.bak-$(date +%F)
+xray.delxray                # 需输入 yes 确认（会停止服务、禁用自启、删除 /var/xray 与 xrayuser）
+bash /root/xray.sh
+```
+
+> ⚠️ **不要在已部署的机器上直接重跑脚本**：它会重新生成密钥与 UUID（现有客户端全部失效）。脚本已内置二次确认，但请把它当"装机脚本"而不是"升级脚本"用。
+> 当前版本不支持命令行参数静默安装；如需无人值守，请在受控环境里用 `expect`/管道喂入应答，并注意重复安装保护需要显式输入 `yes`。
+
 ## 安装后会生成什么
 
 **文件与权限**（`/var/xray`）：
