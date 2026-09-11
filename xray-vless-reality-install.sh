@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.0.1 (2026-09-11)
+# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.0.2 (2026-09-11)
 # ----------------------------------------------------------------------------
 # 功能：交互式部署 Xray 服务端，二选一：
 #   ① REALITY（+ sni-filter：443 由 sni-filter 监听，xray 走 unix socket）
@@ -51,7 +51,7 @@ if [ -f "$workdir/config.json" ]; then
     [ "$rerun_confirm" = "yes" ] || { echo "已取消"; exit 0; }
 fi
 
-echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.0.1${C_NC}"
+echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.0.2${C_NC}"
 echo ""
 echo "         _      _   __        _                   _ "
 echo "   ___  | |  __| | / _| _ __ (_)  ___  _ __    __| |"
@@ -158,7 +158,7 @@ ddns_enabled="no"; ddns_type=""; ddns_target_ip=""; ddns_strategy=""
 mtu_enabled="no"; mtu_interface="eth0"; mtu_value="1390"
 
 # REALITY 特有变量
-domain_s="tesla.com"
+domain_s="www.fastly.com"
 
 # VLESS Encryption 特有变量
 vless_key_mode="mlkem768"
@@ -291,7 +291,7 @@ read -rp "监听IP (默认0.0.0.0): " ipaddr; [ -z "$ipaddr" ] && ipaddr="0.0.0.
 read -rp "监听端口 (默认443): " portx; [ -z "$portx" ] && portx="443"
 
 if [ "$protocol" = "reality" ]; then
-    read -rp "伪装域名 (默认tesla.com): " domain_s; [ -z "$domain_s" ] && domain_s="tesla.com"
+    read -rp "伪装域名 (默认www.fastly.com): " domain_s; [ -z "$domain_s" ] && domain_s="www.fastly.com"
 
     if command -v whiptail &>/dev/null; then
         fp_choice=$(whiptail --title "浏览器指纹" --menu "选择指纹" 15 50 5 \
