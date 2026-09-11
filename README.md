@@ -110,17 +110,18 @@ bash /root/xray.sh
 
 > **伪装域名（`dest`）怎么选**
 >
-> - 硬性条件：必须支持 **TLS1.3**；建议同时支持 **HTTP/2**（ALPN `h2`）。
+> - 硬性条件只有一条：**你的 VPS 能与它完成 TLS1.3 握手**。REALITY 是把 ClientHello 透明转发给 `dest`、用它的真实证书完成握手，
+>   **HTTP 层返回什么都不影响可用性**（返回 403 也一样）。
+> - ⚠️ **不要在 VPS 上判断 h2**：CDN（Akamai 等）常对数据中心 IP 直接返回 403 并**把 ALPN 降级为 http/1.1**，会得出错误结论。
+>   实测对比：`tesla.com` 从 VPS 看是「无 h2 + 403」，但在普通网络的浏览器里 `window.chrome.loadTimes().npnNegotiatedProtocol` = **`h2`**。
+> - 要确认 h2，请在**普通网络**上用浏览器：DevTools → Network → 打开 **Protocol** 列查看；或 Console 执行 `window.chrome.loadTimes().npnNegotiatedProtocol`。
 > - 建议：选**境外**、**非自有**、内容稳定的站点；若域名会 301/302，**直接填跳转后的最终域名**。
-> - 本项目的取值：脚本默认 **`www.fastly.com`**（实测 TLS1.3 + h2 + HTTP 200、握手约 20 ms）；历史默认值 **`tesla.com`** 也长期在用。
-> - 判据只看 **TLS 握手**：REALITY 是把 ClientHello 透明转发给 `dest`、用它的真实证书完成握手，**HTTP 层返回什么都不影响可用性**（例如 `tesla.com` 对数据中心 IP 返 403，但 TLS1.3 握手正常，因此完全可用）。h2 属于"伪装更像"的加分项，不是硬性要求。
-> - ⚠️ 请**从你的 VPS 上**自测（REALITY 是**服务端去连 `dest`**，从手机测没有意义）；且下列检查只是**必要条件、不是充分条件**，最终以客户端能否连通为准：
+> - 本项目的取值：脚本默认 **`www.fastly.com`**；常用 **`tesla.com`**（历史默认值，长期在用）。
+> - VPS 侧自检（**只需要第一条**）：
 >
 > ```bash
-> openssl s_client -connect www.fastly.com:443 -tls1_3 </dev/null 2>/dev/null | grep -m1 'New, TLSv1.3'
-> openssl s_client -connect www.fastly.com:443 -tls1_3 -alpn h2 </dev/null 2>/dev/null | grep -m1 'ALPN protocol'
-> curl -s -o /dev/null -w 'HTTP=%{http_code} 协议=%{http_version}
-' -m 20 https://www.fastly.com
+> openssl s_client -connect tesla.com:443 -tls1_3 </dev/null 2>/dev/null | grep -m1 'New, TLSv1.3'   # 有输出 = TLS1.3 握手 OK
+> curl -sI https://tesla.com | head -1          # 403/200 都不影响 REALITY，仅供了解
 > ```
 >
 
@@ -311,6 +312,7 @@ xray.delxray            # 需输入 yes 确认；会停止服务、禁用开机�
 - **默认伪装域名**由 `tesla.com` 改为 **`www.fastly.com`** —— 实测（从服务端发起）：TLS1.3 + HTTP/2 + HTTP 200、握手约 20 ms。
 - `tesla.com` 仍是**可用**选项：它的 HTTP 层对数据中心 IP 返 403，但 TLS1.3 握手正常 —— REALITY 只用握手，故不受影响（此前把 403 当作"不可用"的表述已更正）。
 - README 的伪装域名示例与判据说明同步更新；无其它功能变更。
+- **h2 判据更正**：不要用 VPS 判断 h2 —— CDN 对数据中心 IP 会返回 403 并把 ALPN 降级为 http/1.1；`tesla.com` 在真实浏览器上实测 `npnNegotiatedProtocol = h2`。
 
 **v1.0.1（2026-09-11）**
 
