@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.0.0 (2026-09-11)
+# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.0.1 (2026-09-11)
 # ----------------------------------------------------------------------------
 # 功能：交互式部署 Xray 服务端，二选一：
 #   ① REALITY（+ sni-filter：443 由 sni-filter 监听，xray 走 unix socket）
@@ -51,7 +51,7 @@ if [ -f "$workdir/config.json" ]; then
     [ "$rerun_confirm" = "yes" ] || { echo "已取消"; exit 0; }
 fi
 
-echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.0.0${C_NC}"
+echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.0.1${C_NC}"
 echo ""
 echo "         _      _   __        _                   _ "
 echo "   ___  | |  __| | / _| _ __ (_)  ___  _ __    __| |"
@@ -526,6 +526,7 @@ chown root:root $workdir/xray
 # 阶段 13：SNI Filter（仅 REALITY 需要）
 # ============================================================
 if [ "$protocol" = "reality" ]; then
+    # sni-filter 来源：本项目 fork 自 oldfriendme/REALITY-sni-filter（MIT），此处取 fork 的 release 产物
     wget -q https://github.com/shirasawatop/REALITY-sni-filter/releases/download/v0.2/autobuild.zip -O autobuild.zip
     unzip -o autobuild.zip -d . && rm autobuild.zip
     case $arch in

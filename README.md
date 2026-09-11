@@ -5,7 +5,7 @@
 
 | 项 | 值 |
 |---|---|
-| 当前版本 | **v1.0.0（2026-09-11）** |
+| 当前版本 | **v1.0.1（2026-09-11）** |
 | 目标系统 | Debian 12 / 13（systemd） |
 | 脚本 | [`xray-vless-reality-install.sh`](./xray-vless-reality-install.sh) |
 | 安装目录 | `/var/xray` |
@@ -164,7 +164,7 @@ xray.delxray            # 需输入 yes 确认；会停止服务、禁用开机�
 | 组件 | 来源 | 用途 |
 |---|---|---|
 | Xray-core **v26.3.27** | `github.com/XTLS/Xray-core` releases | 服务端本体（三个架构分支） |
-| realtime sni-filter **v0.2** | `github.com/shirasawatop/REALITY-sni-filter` releases（**与本项目同作者**） | **仅 REALITY 形态**：443 监听者 |
+| realtime sni-filter **v0.2** | `github.com/shirasawatop/REALITY-sni-filter` releases —— **本项目 fork，上游 [oldfriendme/REALITY-sni-filter](https://github.com/oldfriendme/REALITY-sni-filter)（MIT）** | **仅 REALITY 形态**：443 监听者 |
 | `cloudflare.com/cdn-cgi/trace` | Cloudflare | 探测公网 IPv4 / IPv6 |
 
 ## 已知限制
@@ -177,6 +177,11 @@ xray.delxray            # 需输入 yes 确认；会停止服务、禁用开机�
 6. `config.json` 的属主为 `xrayuser` 还是 `root:xrayuser` 取决于部署时的版本；本版本使用后者。
 
 ## 变更记录
+
+**v1.0.1（2026-09-11）**
+
+- **署名更正**：REALITY 形态使用的 `sni-filter` 系 **[oldfriendme/REALITY-sni-filter](https://github.com/oldfriendme/REALITY-sni-filter)（MIT）的 fork** —— README 与脚本内均已标注上游来源，感谢原作者。
+- 无功能变更（仅文档与注释）。
 
 **v1.0.0（2026-09-11）** —— 首次公开发布
 
@@ -191,4 +196,4 @@ xray.delxray            # 需输入 yes 确认；会停止服务、禁用开机�
 **MIT License** ｜ Copyright (c) 2026 [shirasawatop](https://github.com/shirasawatop) ｜ 全文见 [`LICENSE`](./LICENSE)
 
 - 可自由使用、修改、分发，需保留版权与许可声明。
-- REALITY 形态会下载 [`REALITY-sni-filter`](https://github.com/shirasawatop/REALITY-sni-filter)（与本项目同作者），该组件按其仓库自身的许可执行；Xray-core 版权归 [XTLS/Xray-core](https://github.com/XTLS/Xray-core) 所有。
+- REALITY 形态会下载 [`REALITY-sni-filter`](https://github.com/shirasawatop/REALITY-sni-filter) —— 该组件是 **[oldfriendme/REALITY-sni-filter](https://github.com/oldfriendme/REALITY-sni-filter)（MIT）的 fork**，感谢原作者；其许可遵循上游仓库，Xray-core 版权归 [XTLS/Xray-core](https://github.com/XTLS/Xray-core) 所有。
