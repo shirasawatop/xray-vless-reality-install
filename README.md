@@ -64,7 +64,7 @@ bash /root/xray-vless-reality-install.sh
 | 4 | 是否开启 DDNS 自动更换 IP | `n` | 开启后生成 `/var/xray/ddns_check.sh` 与 `ddns.config`（**定时需自行挂 cron**） |
 | 5 | 是否开启 MTU 调整 | `n` | 接口默认 `eth0`、值默认 `1390`，以 `ExecStartPre=ip link set …` 写入 unit |
 | 6 | 监听 IP / 端口 | `0.0.0.0` / `443` | 443 需 `CAP_NET_BIND_SERVICE`（脚本已处理） |
-| 6a | **REALITY 专属**：伪装域名 | `tesla.com` | 建议选**支持 TLS1.3 的境外站点**；`dest=域名:443`、`serverNames=[域名]` |
+| 6a | **REALITY 专属**：伪装域名 | `tesla.com` | 需**支持 TLS1.3**（通常还要 HTTP/2）的境外站点，如 **`amd.com`**；`dest=域名:443`、`serverNames=[域名]`（选法见「例 1」下方） |
 | 6b | **REALITY 专属**：指纹 `fp` | `chrome` | 可选 chrome / firefox / safari / ios / edge |
 | 6c | **Encryption 专属**：密钥模式 | `mlkem768` | `mlkem768`（抗量子，推荐）/ `x25519`（传统） |
 | 6d | **Encryption 专属**：外观 | `native` | `native` / `xorpub` / `random`（越靠后越隐蔽） |
@@ -102,11 +102,27 @@ bash /root/xray.sh
 | `开启 MTU 调整？(y/n):` | `n` | 隧道环境可改 `y` + MTU `1390` |
 | `监听IP (默认0.0.0.0):` | 回车 | 默认即可（亦可用 `::` 走双栈） |
 | `监听端口 (默认443):` | 回车 | 443 需要 `CAP_NET_BIND_SERVICE`（脚本已处理） |
-| `伪装域名 (默认tesla.com):` | 回车 或 `www.microsoft.com` | 选**支持 TLS1.3 的境外站点** |
+| `伪装域名 (默认tesla.com):` | 回车 或 **`amd.com`** | 选支持 TLS1.3 的境外站点（**不要用 `www.microsoft.com`**，见下方说明） |
 | `选择 (默认 chrome):` | 回车 | 客户端指纹 `fp` |
 | `选择落地方式:` | `1` | 1 = 直接落地 |
 
 结束时脚本会打印：`[✓]` 四项自检 + **IPv4 订阅链接** + 管理命令清单。
+
+> **伪装域名（`dest`）怎么选**
+>
+> - 硬性条件：必须支持 **TLS1.3**；建议同时支持 **HTTP/2**（ALPN `h2`）。
+> - 建议：选**境外**、**非自有**、内容稳定的站点；若域名会 301/302，直接用**跳转后的最终域名**更稳妥。
+> - ✔ 推荐示例：**`amd.com`**、`tesla.com`（脚本默认值，仅作占位，请自行确认在你所在网络可达）。
+> - ❌ **不要用 `www.microsoft.com`** —— 据实测它**不可用作 `dest`**。注意：它表面上能满足下面三项检查，
+>   所以**这些检查只是必要条件、不是充分条件**，最终以客户端能否连通为准。
+>
+> 服务端自检（三行都通过才值得继续试）：
+>
+> ```bash
+> openssl s_client -connect amd.com:443 -tls1_3 </dev/null 2>/dev/null | grep -m1 'New, TLSv1.3'
+> openssl s_client -connect amd.com:443 -tls1_3 -alpn h2 </dev/null 2>/dev/null | grep -m1 'ALPN protocol'
+> curl -sI https://amd.com | head -1          # 期望 200；若跳转到其他主域则不要用该域名
+> ```
 
 ### 例 2：部署 VLESS Encryption（抗量子）
 
