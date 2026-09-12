@@ -294,7 +294,7 @@ systemctl list-timers xray-ddns.timer 2>/dev/null || echo "未启用 DDNS"
 - **重跑会重新生成 REALITY 密钥与 UUID 并覆盖 `config.json`** ⇒ 现有客户端立即失效（脚本已内置二次确认）。
 - `xray.chaguuid` 会更换 UUID，**所有客户端需同步更新**；`xray.delxray` 为破坏性操作（`rm -rf /var/xray`）并需 `yes` 确认。
 - `chaguuid` 换 UUID 时的 `sed` 替换已做**输入白名单 + 长度 + 定点存在性 + 元字符转义**四重校验，避免恶意 `uuid.txt` 内容注入 `sed` 命令（历史上这类写法可导致 root 命令执行）。
-- 安装收尾会执行**目录收口**：`/var/xray` → `root:root 755`，并把运行期文件预建给 `xrayuser` —— 避免「低权账户可 `unlink` 并重建 root 文件」的完整性面（DDNS 形态除外，见「已知限制」）。
+- 安装收尾会执行**目录收口**：`/var/xray` → `root:root 755`，并把运行期文件预建给 `xrayuser` —— 避免「低权账户可 `unlink` 并重建 root 文件」的完整性面（v1.0.4 起 DDNS 形态同样适用，见「已知限制」第 7 条）。
 - 本脚本**不配置防火墙 / BBR / fail2ban / SSH 加固**，请自行完成主机侧基线加固。
 - 脚本会创建系统用户 `xrayuser`（`/sbin/nologin`）并写 `/etc/systemd/system/xray_service.service`。
 
@@ -316,10 +316,14 @@ xray.delxray            # 需输入 yes 确认；会停止服务、禁用开机�
 
 1. 仅在 Debian 12/13（systemd）实测；其它发行版可能需要自行适配。
 2. Xray 版本在脚本内**硬编码**（`v26.3.27`，3 处 URL），升级需手动改。
-3. DDNS 只生成脚本并执行一次，**定时调度需自行挂 cron / systemd timer**。
+3. DDNS 会生成 `ddns_check.sh`，并**自动安装并启用** `xray-ddns.service` + `xray-ddns.timer`（每 `60s`，以 root 运行）；仅当你停用该 timer 时，才需要自行挂 cron / systemd timer 兜底。
 4. 安装后只验证**服务端**（服务状态、端口、进程）；真实客户端连通性请自行测试。
 5. 未启用 `set -u`（脚本内可选变量较多，逐条排查成本较高）。
-6. `config.json` 的属主为 `xrayuser` 还是 `root:xrayuser` 取决于部署时的版本；本版本使用后者。
+6. `config.json` 固定为 **`640 root:xrayuser`**（服务账户只经 group 位读取）。若你的部署来自早期版本（属主为 `xrayuser`），一条命令即可统一 —— 内容不变，且 `sed -i` 会保留新归属（实测：`640 root:xrayuser` 经 `sed -i` 后**归属与 md5 均不变**）：
+
+   ```bash
+   chown root:xrayuser /var/xray/config.json && chmod 640 /var/xray/config.json
+   ```
 7. **DDNS 刻意以 root 运行**（`xray-ddns.timer` → `ddns_check.sh`）：这样 `/var/xray` 才能保持 `root:root` 收口。若你改成非 root 运行，需自行放宽目录权限（不建议，会重新打开「低权账户可 unlink + 重建 root 文件」的完整性面）。
 
 ## 变更记录
