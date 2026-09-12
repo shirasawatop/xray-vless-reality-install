@@ -5,7 +5,7 @@
 
 | 项 | 值 |
 |---|---|
-| 当前版本 | **v1.0.2（2026-09-11）** |
+| 当前版本 | **v1.0.3（2026-09-12）** |
 | 目标系统 | Debian 12 / 13（systemd） |
 | 脚本 | [`xray-vless-reality-install.sh`](./xray-vless-reality-install.sh) |
 | 安装目录 | `/var/xray` |
@@ -218,7 +218,7 @@ bash /root/xray.sh
 | `chaguuid` | `700` | `root:root` | **内联客户端订阅参数**，故仅 root 可读 |
 | `xray{start,stop,restart,help,status,log}`、`delxray` | `755` | `root:root` | 管理脚本 |
 | `socket/`、`xray.pid`、`sni-filter.pid`、`statusfilter` | — | `xrayuser:xrayuser` | 运行期产物 |
-| 目录 `/var/xray` | `755` | `xrayuser:xrayuser` | 服务需要在其中写 pid / socket |
+| 目录 `/var/xray` | `755` | **`root:root`** | 安装收尾（阶段 20）收归 `root`：服务账户不再能重建目录内文件；运行期需写的文件已预建并留给 `xrayuser` |
 
 **其它位置**：
 
@@ -227,7 +227,7 @@ bash /root/xray.sh
 | `/etc/systemd/system/xray_service.service` | systemd 单元（`User=xrayuser` + `AmbientCapabilities`） |
 | `/usr/bin/xray.*`、`/usr/local/bin/xray.*` | 管理命令符号链接（`xray.chaguuid`、`xray.status` 等） |
 
-> **权限模型的设计意图**：服务以低权账户 `xrayuser` 运行，但**二进制与入口脚本归 `root`**，避免"低权账户可写、root 可执行"这一经典提权组合；`config.json` 与含密钥的脚本只给到必要的读权限。请勿随意放宽上述权限。
+> **权限模型的设计意图**：服务以低权账户 `xrayuser` 运行，但**二进制与入口脚本归 `root`**，避免"低权账户可写、root 可执行"这一经典提权组合；`config.json` 与含密钥的脚本只给到必要的读权限。**目录亦已收归 `root`** —— 只把运行期产物（`xray.pid` / `sni-filter.pid` / `statusfilter` / `socket/`）留给服务账户。请勿随意放宽上述权限。
 
 ## 管理命令
 
@@ -279,6 +279,7 @@ stat -c '%n %a %U:%G' /var/xray/xray /var/xray/sni-filter /var/xray/config.json 
 - **重跑会重新生成 REALITY 密钥与 UUID 并覆盖 `config.json`** ⇒ 现有客户端立即失效（脚本已内置二次确认）。
 - `xray.chaguuid` 会更换 UUID，**所有客户端需同步更新**；`xray.delxray` 为破坏性操作（`rm -rf /var/xray`）并需 `yes` 确认。
 - `chaguuid` 换 UUID 时的 `sed` 替换已做**输入白名单 + 长度 + 定点存在性 + 元字符转义**四重校验，避免恶意 `uuid.txt` 内容注入 `sed` 命令（历史上这类写法可导致 root 命令执行）。
+- 安装收尾会执行**目录收口**：`/var/xray` → `root:root 755`，并把运行期文件预建给 `xrayuser` —— 避免「低权账户可 `unlink` 并重建 root 文件」的完整性面（DDNS 形态除外，见「已知限制」）。
 - 本脚本**不配置防火墙 / BBR / fail2ban / SSH 加固**，请自行完成主机侧基线加固。
 - 脚本会创建系统用户 `xrayuser`（`/sbin/nologin`）并写 `/etc/systemd/system/xray_service.service`。
 
@@ -304,8 +305,17 @@ xray.delxray            # 需输入 yes 确认；会停止服务、禁用开机�
 4. 安装后只验证**服务端**（服务状态、端口、进程）；真实客户端连通性请自行测试。
 5. 未启用 `set -u`（脚本内可选变量较多，逐条排查成本较高）。
 6. `config.json` 的属主为 `xrayuser` 还是 `root:xrayuser` 取决于部署时的版本；本版本使用后者。
+7. **DDNS 与「目录收口」互斥**：启用 DDNS 时脚本会跳过 `/var/xray` 的目录收口（原因见「变更记录 v1.0.3」）。若既要 DDNS 又要收口，请把 `ddns_check.sh` 交给 **root** 的 cron / systemd timer 运行（例 3 已给出 cron 写法），并确认 `xrayinit` 里不再由服务账户调用它。
 
 ## 变更记录
+
+**v1.0.3（2026-09-12）**
+
+- **新增阶段 20「权限收口（目录完整性面）」**：安装收尾把 `/var/xray` 目录由 `xrayuser:xrayuser` 收归 **`root:root` `755`**，并把运行期需要写入的文件（`xray.pid`、`statusfilter`；REALITY 形态另加 `sni-filter.pid`）**预建**并留给 `xrayuser`；`socket/` 仍归 `xrayuser`。
+  - 修复的问题：目录可写 ⇒ 即使二进制 / 入口脚本已归 `root`，服务账户仍可 `unlink` **并重建**它们，构成「低权账户先落地、等管理员执行 `xray.chaguuid`」的提权链（`chaguuid` 以 root 执行 `/var/xray/xray`）。
+  - 处置顺序：**先预建运行期文件、再收目录**（顺序颠倒会让服务账户无法再创建 pid 文件）。
+- **DDNS 与目录收口互斥**：DDNS 由 `xrayinit`（`xrayuser` 身份）调用 `ddns_check.sh`，其重写 `config.json` 依赖目录写权限（`sed -i` = 同目录临时文件 + rename）。启用 DDNS 时脚本**跳过目录收口并打印警告**；如需同时收口，请改用 root 定时器运行 `ddns_check.sh`（见「已知限制」第 7 条）。
+- 头部「权限模型」注释与 README 权限表同步更新；**无其它行为变更**。
 
 **v1.0.2（2026-09-11）**
 

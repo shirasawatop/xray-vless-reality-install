@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.0.2 (2026-09-11)
+# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.0.3 (2026-09-12)
 # ----------------------------------------------------------------------------
 # 功能：交互式部署 Xray 服务端，二选一：
 #   ① REALITY（+ sni-filter：443 由 sni-filter 监听，xray 走 unix socket）
@@ -11,7 +11,8 @@
 #   - 服务以 xrayuser 运行；二进制与入口脚本归 root（root:root 755）
 #   - config.json → root:xrayuser 640     uuid.txt → root:root 600
 #   - chaguuid 内联客户端参数 → root:root 700
-#   - 目录 /var/xray 归 xrayuser（服务需写 pid / socket）
+#   - 目录 /var/xray 归 root（755）；仅 xray.pid / sni-filter.pid / statusfilter
+#     与 socket/ 归 xrayuser（运行期写入；目录收口见阶段 20）
 #
 # 注意：在已有部署上重跑本脚本会重新生成密钥与 UUID（现有客户端立即失效）；
 #       脚本已内置 root / 依赖 / 重复安装三项前置检查与二次确认。
@@ -51,7 +52,7 @@ if [ -f "$workdir/config.json" ]; then
     [ "$rerun_confirm" = "yes" ] || { echo "已取消"; exit 0; }
 fi
 
-echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.0.2${C_NC}"
+echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.0.3${C_NC}"
 echo ""
 echo "         _      _   __        _                   _ "
 echo "   ___  | |  __| | / _| _ __ (_)  ___  _ __    __| |"
@@ -518,7 +519,7 @@ echo "配置已生成"
 # ============================================================
 useradd xrayuser &>/dev/null || true
 usermod -s /sbin/nologin xrayuser
-chown -R xrayuser:xrayuser $workdir
+chown -R xrayuser:xrayuser $workdir   # 注意：本行会把**目录本身**也交给服务账户；阶段 20 做目录收口
 chown root:xrayuser $workdir/config.json && chmod 640 $workdir/config.json
 chown root:root $workdir/xray
 
@@ -801,7 +802,44 @@ if [ $verify_ok -eq 0 ]; then
 fi
 
 # ============================================================
-# 阶段 20：输出订阅
+# 阶段 20：权限收口（目录完整性面）★ 安全关键
+# ============================================================
+# 背景：
+#   阶段 12 的 `chown -R xrayuser:xrayuser $workdir` 会把**目录本身**也交给服务账户。
+#   目录可写 ⇒ 即使二进制 / 入口脚本已收归 root:root，服务账户仍可 unlink + 重建它们；
+#   而 `chaguuid` 以 root 执行 $workdir/xray ⇒ 形成「先落地、等管理员执行
+#   xray.chaguuid」的提权链（项目手册 §12.12 F.2 / §12.15 / §12.16 有实测记录）。
+#
+# 处置：
+#   1) 目录收归 root:root（保留 755：服务账户需 o+rx 穿越，并读取 xrayinit / config.json）
+#   2) 运行期由服务账户写入的文件**预建**并留给其持有（必须先建、再收目录）
+#   3) socket/ 子目录保持 xrayuser（xray 在其中创建 unix socket 与 lock）
+#
+# DDNS 例外（二者互斥）：
+#   DDNS 路径由 xrayinit（xrayuser 身份）调用 ddns_check.sh，其重写 config.json 依赖
+#   **目录写权限**（`sed -i` = 同目录临时文件 + rename）。为不改变既有行为，启用 DDNS 时
+#   跳过目录收口并打印警告；如需同时收口，请改用 root 定时器运行 ddns_check.sh
+#   （见 README「已知限制」）。
+# ============================================================
+if [ "$ddns_enabled" = "yes" ]; then
+    echo -e "${C_YELLOW}[!] 已启用 DDNS：跳过目录权限收口（DDNS 重写 config.json 需要目录写权限）${C_NC}"
+    echo -e "${C_YELLOW}    如需收口，请改用 root 定时器运行 ddns_check.sh，并参阅 README「已知限制」${C_NC}"
+else
+    touch $workdir/xray.pid $workdir/statusfilter
+    chown xrayuser:xrayuser $workdir/xray.pid $workdir/statusfilter
+    chmod 644 $workdir/xray.pid $workdir/statusfilter
+    if [ -f "$workdir/sni-filter" ]; then
+        touch $workdir/sni-filter.pid
+        chown xrayuser:xrayuser $workdir/sni-filter.pid
+        chmod 644 $workdir/sni-filter.pid
+    fi
+    chown root:root $workdir
+    chmod 755 $workdir
+    echo -e "${C_GREEN}[✓] 目录权限收口: $workdir → root:root 755（运行期文件保留 xrayuser）${C_NC}"
+fi
+
+# ============================================================
+# 阶段 21：输出订阅
 # ============================================================
 echo ""
 echo "========== 安装完成 =========="
