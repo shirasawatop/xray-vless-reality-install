@@ -5,7 +5,7 @@
 
 | 项 | 值 |
 |---|---|
-| 当前版本 | **v1.0.3（2026-09-12）** |
+| 当前版本 | **v1.0.4（2026-09-12）** |
 | 目标系统 | Debian 12 / 13（systemd） |
 | 脚本 | [`xray-vless-reality-install.sh`](./xray-vless-reality-install.sh) |
 | 安装目录 | `/var/xray` |
@@ -27,6 +27,7 @@
 - **成体系的权限模型**（本脚本的重点，见下文）：二进制与入口脚本归 `root`、服务账户只读可执行；`config.json` 为 `640 root:xrayuser`；含密钥的管理脚本 `700`。
 - **前置检查**：root 身份校验、依赖检查（`wget` / `openssl` / `unzip`）、**重复安装二次确认**。
 - **systemd 集成**：`User=xrayuser` + `AmbientCapabilities=CAP_NET_BIND_SERVICE`（**不使用 `setcap`**）、`Restart=on-failure`。
+- **运行期文件自愈**：服务单元的 `ExecStartPre` 会在每次启动（含开机）重建 `xray.pid` / `sni-filter.pid` / `statusfilter` 并交还 `xrayuser` —— 配合「目录收归 `root`」，误删也不会卡住服务。
 - 可选：IPv4/IPv6 出口选择与优先顺序、DDNS 检测脚本、MTU 调整（经 unit 的 `ExecStartPre` 生效）、socks5 落地。
 
 ## 环境要求
@@ -141,12 +142,18 @@ bash /root/xray.sh
 ### 例 3：socks5 落地 + DDNS + MTU（进阶）
 
 落地方式选 `2`，随后填写上游 socks5 的 `IP / 端口 / 用户 / 密码`；DDNS 与 MTU 均答 `y`。DDNS 会生成
-`/var/xray/ddns_check.sh` 与 `/var/xray/ddns.config`（**定时任务需自行添加**）：
+`/var/xray/ddns_check.sh`、`/var/xray/ddns.config`，以及 **`xray-ddns.service` + `xray-ddns.timer`
+（systemd，每 `60s` 一次，以 root 运行）** —— 安装时即启用，**无需手工添加定时任务**：
 
 ```bash
-# 每 5 分钟检查一次出口 IP 是否失效（示例）
-echo '*/5 * * * * root /var/xray/ddns_check.sh >/dev/null 2>&1' > /etc/cron.d/xray-ddns
+systemctl list-timers xray-ddns.timer    # 下次触发时间
+systemctl status xray-ddns.service       # 单次执行的退出状态（oneshot）
+journalctl -u xray-ddns.service -n 50    # 执行日志
 ```
+
+> **为什么以 root 运行**：`ddns_check.sh` 需要重写 `config.json`（`sed -i` = 同目录临时文件 + 重命名），
+> 因此需要 `/var/xray` 的目录写权限；交给 root 后，`/var/xray` 依然可以安全地收归 `root:root`（阶段 20）。
+> 若你更习惯 cron，可自行加一条 **root** 的 cron（`* * * * * root /var/xray/ddns_check.sh`）并停用该 timer。
 
 ### 例 4：日常运维
 
@@ -227,6 +234,8 @@ bash /root/xray.sh
 | `/etc/systemd/system/xray_service.service` | systemd 单元（`User=xrayuser` + `AmbientCapabilities`） |
 | `/usr/bin/xray.*`、`/usr/local/bin/xray.*` | 管理命令符号链接（`xray.chaguuid`、`xray.status` 等） |
 
+> **运行期文件自愈**：`xray.pid` / `sni-filter.pid` / `statusfilter` 由单元 `ExecStartPre` 在每次启动（含开机）重建并 `chown xrayuser` —— 被误删时 `systemctl restart xray_service` 即可恢复，无需手工 `touch`。
+
 > **权限模型的设计意图**：服务以低权账户 `xrayuser` 运行，但**二进制与入口脚本归 `root`**，避免"低权账户可写、root 可执行"这一经典提权组合；`config.json` 与含密钥的脚本只给到必要的读权限。**目录亦已收归 `root`** —— 只把运行期产物（`xray.pid` / `sni-filter.pid` / `statusfilter` / `socket/`）留给服务账户。请勿随意放宽上述权限。
 
 ## 管理命令
@@ -263,6 +272,12 @@ journalctl -u xray_service -n 50 --no-pager
 
 # 权限复核（应与此一致）
 stat -c '%n %a %U:%G' /var/xray/xray /var/xray/sni-filter /var/xray/config.json /var/xray/chaguuid
+
+# 运行期文件自愈（v1.0.4+）：删掉后重启应自动重建并归属 xrayuser
+rm -f /var/xray/xray.pid && systemctl restart xray_service && ls -l /var/xray/xray.pid
+
+# DDNS 定时器（仅启用 DDNS 时存在）
+systemctl list-timers xray-ddns.timer 2>/dev/null || echo "未启用 DDNS"
 ```
 
 | 现象 | 排查方向 |
@@ -305,9 +320,19 @@ xray.delxray            # 需输入 yes 确认；会停止服务、禁用开机�
 4. 安装后只验证**服务端**（服务状态、端口、进程）；真实客户端连通性请自行测试。
 5. 未启用 `set -u`（脚本内可选变量较多，逐条排查成本较高）。
 6. `config.json` 的属主为 `xrayuser` 还是 `root:xrayuser` 取决于部署时的版本；本版本使用后者。
-7. **DDNS 与「目录收口」互斥**：启用 DDNS 时脚本会跳过 `/var/xray` 的目录收口（原因见「变更记录 v1.0.3」）。若既要 DDNS 又要收口，请把 `ddns_check.sh` 交给 **root** 的 cron / systemd timer 运行（例 3 已给出 cron 写法），并确认 `xrayinit` 里不再由服务账户调用它。
+7. **DDNS 刻意以 root 运行**（`xray-ddns.timer` → `ddns_check.sh`）：这样 `/var/xray` 才能保持 `root:root` 收口。若你改成非 root 运行，需自行放宽目录权限（不建议，会重新打开「低权账户可 unlink + 重建 root 文件」的完整性面）。
 
 ## 变更记录
+
+**v1.0.4（2026-09-12）**
+
+- **DDNS 定时改由 root 的 systemd timer 驱动**（新增 `xray-ddns.service` + `xray-ddns.timer`，每 `60s`）：
+  - `xrayinit` 不再内嵌「每 60 s 调 `ddns_check.sh`」的循环（改为恒定驻留循环，仅用于保活）；
+  - `ddns_check.sh` 的重启动作由 `kill + setsid` 改为 **`systemctl restart xray_service`**（避免以 root 拉起服务进程）；
+  - **因此 DDNS 形态不再豁免目录收口**（废除 v1.0.3 的例外）。
+- **服务单元新增「运行期文件自愈」**：`ExecStartPre=+/bin/sh -c 'touch …; chown xrayuser …'` ——
+  `xray.pid` / `sni-filter.pid` / `statusfilter` 被误删后，`systemctl restart`（或机器重启）即自动重建并交还 `xrayuser`。
+- 头部「权限模型」注释、README（特性 / 例 3 / 已知限制 / 排障）同步更新；**无其它行为变更**。
 
 **v1.0.3（2026-09-12）**
 

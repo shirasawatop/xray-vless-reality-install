@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.0.3 (2026-09-12)
+# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.0.4 (2026-09-12)
 # ----------------------------------------------------------------------------
 # 功能：交互式部署 Xray 服务端，二选一：
 #   ① REALITY（+ sni-filter：443 由 sni-filter 监听，xray 走 unix socket）
@@ -13,6 +13,8 @@
 #   - chaguuid 内联客户端参数 → root:root 700
 #   - 目录 /var/xray 归 root（755）；仅 xray.pid / sni-filter.pid / statusfilter
 #     与 socket/ 归 xrayuser（运行期写入；目录收口见阶段 20）
+#   - 运行期文件由服务单元的 ExecStartPre 自愈（误删后重启即重建；阶段 16）
+#   - DDNS 定时由 root 的 systemd timer 驱动（xray-ddns.timer；阶段 15）
 #
 # 注意：在已有部署上重跑本脚本会重新生成密钥与 UUID（现有客户端立即失效）；
 #       脚本已内置 root / 依赖 / 重复安装三项前置检查与二次确认。
@@ -52,7 +54,7 @@ if [ -f "$workdir/config.json" ]; then
     [ "$rerun_confirm" = "yes" ] || { echo "已取消"; exit 0; }
 fi
 
-echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.0.3${C_NC}"
+echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.0.4${C_NC}"
 echo ""
 echo "         _      _   __        _                   _ "
 echo "   ___  | |  __| | / _| _ __ (_)  ___  _ __    __| |"
@@ -611,33 +613,47 @@ if [ -n "$new_ip" ]; then
         sed -i "s/$target_ip/$new_ip/g" DDNS_DIR/$cfg
     done
     echo "$ddns_type $new_ip $strategy" > "$config_file"
-    kill $(cat DDNS_DIR/xray.pid) 2>/dev/null; sleep 1
-    if [ -f DDNS_DIR/sni-filter.pid ]; then
-        kill $(cat DDNS_DIR/sni-filter.pid) 2>/dev/null
-        setsid DDNS_DIR/sni-filter -L=tcp://LISTEN_IP:LISTEN_PORT -F=unix://DDNS_DIR/socket/xray.friend -S=SNI_DOMAIN &
-        echo $! > DDNS_DIR/sni-filter.pid
-    fi
-    setsid DDNS_DIR/xray -c DDNS_DIR/config.json &
-    echo $! > DDNS_DIR/xray.pid
+    # 用 systemd 重启服务（而不是 kill + setsid 手工拉起）：
+    # 本脚本自 v1.0.4 起由 **root** 的 systemd timer 触发，手工 setsid 会让 xray / sni-filter 以 root 运行。
+    systemctl restart xray_service
 fi
 EOSH
-    sed -i "s|CONFIG_FILES|$config_files|g; s|LISTEN_IP|$ipaddr|g; s|LISTEN_PORT|$portx|g; s|SNI_DOMAIN|$domain_s|g" ddns_check.sh
+    sed -i "s|CONFIG_FILES|$config_files|g" ddns_check.sh
     sed -i "s|DDNS_DIR|$workdir|g" ddns_check.sh
     chmod +x ddns_check.sh
     echo "$ddns_type $ddns_target_ip $ddns_strategy" > ddns.config
     chown xrayuser:xrayuser ddns.config && chmod 600 ddns.config
 
-    cat >> xrayinit << EOF
-while true; do
-    sleep 60
-    $workdir/ddns_check.sh
-done
+    # DDNS 定时改由 **root** 的 systemd timer 驱动（不再由服务账户的内嵌循环调用）：
+    # ddns_check.sh 需要重写 config.json（sed -i = 同目录临时文件 + rename）⇒ 需要目录写权限；
+    # 交给 root 既满足该要求，也让 $workdir 可以安全收归 root（见阶段 20）。
+    cat > /etc/systemd/system/xray-ddns.service << EOF
+[Unit]
+Description=Xray DDNS check (exit IP changed?)
+After=xray_service.service
+
+[Service]
+Type=oneshot
+ExecStart=$workdir/ddns_check.sh
 EOF
-else
-    cat >> xrayinit << 'EOF'
-while true; do sleep 3600; done
+
+    cat > /etc/systemd/system/xray-ddns.timer << 'EOF'
+[Unit]
+Description=Xray DDNS check timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
 EOF
 fi
+
+cat >> xrayinit << 'EOF'
+while true; do sleep 3600; done
+EOF
 
 # ============================================================
 # 阶段 16：Systemd 服务（★ 核心修复：AmbientCapabilities）
@@ -655,6 +671,8 @@ After=network.target
 [Service]
 Type=simple
 ${mtu_line}
+# 运行期文件自愈：即使被误删，每次启动（含开机）都会重建并交还 xrayuser
+ExecStartPre=+/bin/sh -c 'touch $workdir/xray.pid $workdir/statusfilter; chown xrayuser:xrayuser $workdir/xray.pid $workdir/statusfilter; chmod 644 $workdir/xray.pid $workdir/statusfilter; if [ -e $workdir/sni-filter ]; then touch $workdir/sni-filter.pid; chown xrayuser:xrayuser $workdir/sni-filter.pid; chmod 644 $workdir/sni-filter.pid; fi'
 ExecStart=/usr/bin/sh $workdir/xrayinit
 User=xrayuser
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -780,6 +798,9 @@ done
 systemctl daemon-reload
 systemctl enable xray_service
 systemctl start xray_service
+if [ "$ddns_enabled" = "yes" ]; then
+    systemctl enable --now xray-ddns.timer
+fi
 
 sleep 2
 
@@ -792,6 +813,9 @@ ss -tlnp 2>/dev/null | grep -q ":${portx}\b" && echo -e "${C_GREEN}[✓] 端口 
 pgrep -f "$workdir/xray" >/dev/null 2>&1 && echo -e "${C_GREEN}[✓] xray 进程运行中${C_NC}" || { echo -e "${C_RED}[✗] xray 进程未运行${C_NC}"; verify_ok=0; }
 if [ "$protocol" = "reality" ]; then
     pgrep -f "$workdir/sni-filter" >/dev/null 2>&1 && echo -e "${C_GREEN}[✓] sni-filter 进程运行中${C_NC}" || { echo -e "${C_RED}[✗] sni-filter 进程未运行${C_NC}"; verify_ok=0; }
+fi
+if [ "$ddns_enabled" = "yes" ]; then
+    systemctl is-active --quiet xray-ddns.timer && echo -e "${C_GREEN}[✓] DDNS 定时器运行中${C_NC}" || { echo -e "${C_RED}[✗] DDNS 定时器未运行${C_NC}"; verify_ok=0; }
 fi
 
 if [ $verify_ok -eq 0 ]; then
@@ -815,28 +839,22 @@ fi
 #   2) 运行期由服务账户写入的文件**预建**并留给其持有（必须先建、再收目录）
 #   3) socket/ 子目录保持 xrayuser（xray 在其中创建 unix socket 与 lock）
 #
-# DDNS 例外（二者互斥）：
-#   DDNS 路径由 xrayinit（xrayuser 身份）调用 ddns_check.sh，其重写 config.json 依赖
-#   **目录写权限**（`sed -i` = 同目录临时文件 + rename）。为不改变既有行为，启用 DDNS 时
-#   跳过目录收口并打印警告；如需同时收口，请改用 root 定时器运行 ddns_check.sh
-#   （见 README「已知限制」）。
+# DDNS 说明（v1.0.4 起不再例外）：
+#   DDNS 定时已改由 **root** 的 systemd timer（xray-ddns.timer）驱动，ddns_check.sh 以 root 运行
+#   ⇒ 重写 config.json 不再依赖目录写权限，故 DDNS 形态同样适用目录收口。
+#   （v1.0.3 曾因「服务账户需目录写权限」而跳过，现已闭合。）
 # ============================================================
-if [ "$ddns_enabled" = "yes" ]; then
-    echo -e "${C_YELLOW}[!] 已启用 DDNS：跳过目录权限收口（DDNS 重写 config.json 需要目录写权限）${C_NC}"
-    echo -e "${C_YELLOW}    如需收口，请改用 root 定时器运行 ddns_check.sh，并参阅 README「已知限制」${C_NC}"
-else
-    touch $workdir/xray.pid $workdir/statusfilter
-    chown xrayuser:xrayuser $workdir/xray.pid $workdir/statusfilter
-    chmod 644 $workdir/xray.pid $workdir/statusfilter
-    if [ -f "$workdir/sni-filter" ]; then
-        touch $workdir/sni-filter.pid
-        chown xrayuser:xrayuser $workdir/sni-filter.pid
-        chmod 644 $workdir/sni-filter.pid
-    fi
-    chown root:root $workdir
-    chmod 755 $workdir
-    echo -e "${C_GREEN}[✓] 目录权限收口: $workdir → root:root 755（运行期文件保留 xrayuser）${C_NC}"
+touch $workdir/xray.pid $workdir/statusfilter
+chown xrayuser:xrayuser $workdir/xray.pid $workdir/statusfilter
+chmod 644 $workdir/xray.pid $workdir/statusfilter
+if [ -f "$workdir/sni-filter" ]; then
+    touch $workdir/sni-filter.pid
+    chown xrayuser:xrayuser $workdir/sni-filter.pid
+    chmod 644 $workdir/sni-filter.pid
 fi
+chown root:root $workdir
+chmod 755 $workdir
+echo -e "${C_GREEN}[✓] 目录权限收口: $workdir → root:root 755（运行期文件保留 xrayuser）${C_NC}"
 
 # ============================================================
 # 阶段 21：输出订阅
