@@ -1,11 +1,20 @@
 #!/bin/bash
 # ============================================================================
-# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.0.4 (2026-09-12)
+# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.1.0 (2026-09-21)
 # ----------------------------------------------------------------------------
 # 功能：交互式部署 Xray 服务端，二选一：
 #   ① REALITY（+ sni-filter：443 由 sni-filter 监听，xray 走 unix socket）
 #   ② VLESS Encryption（xray 本体监听 443）
-#   部署后生成管理命令：xray.chaguuid / start / stop / restart / status / log / help / delxray
+#   部署后生成管理命令：xray.chaguuid / start / stop / restart / status / log / stats / help / delxray
+#
+# 流量统计（v1.1.0 新增；安装时询问，默认开启；关闭则完全不生成相关配置）：
+#   - 启用 stats + api(StatsService) + policy（用户级 / 系统级计数）
+#   - api 入站为 dokodemo-door，仅监听 127.0.0.1:<apiport>（默认 10085），
+#     由 routing **首位**规则 inboundTag["api"] → outboundTag"api" 内联 ⇒ 公网不可达
+#   - 主入站加 tag（默认 vless-in）+ 首个客户端加 email（默认 client-1）⇒ 计数键名可读
+#   - 管理命令 xray.stats 查询；统计为**内存态**，重启 xray_service 即归零
+#   - ★ 不变量：api 路由规则必须位于 rules 首位。否则会被 direct-ipv4/ipv6 这类
+#     **不限定入站**的规则截走，statsquery 静默失效（详见阶段 10 / 11 注释）
 #
 # 权限模型（有意为之，勿随意放宽）：
 #   - 服务以 xrayuser 运行；二进制与入口脚本归 root（root:root 755）
@@ -15,9 +24,11 @@
 #     与 socket/ 归 xrayuser（运行期写入；目录收口见阶段 20）
 #   - 运行期文件由服务单元的 ExecStartPre 自愈（误删后重启即重建；阶段 16）
 #   - DDNS 定时由 root 的 systemd timer 驱动（xray-ddns.timer；阶段 15）
+#   - 流量统计不写盘、不需新增 capability（api 端口 >1024，服务仍以 xrayuser 运行）
 #
 # 注意：在已有部署上重跑本脚本会重新生成密钥与 UUID（现有客户端立即失效）；
 #       脚本已内置 root / 依赖 / 重复安装三项前置检查与二次确认。
+#       既有部署若需补装统计而不重装，可用配套的 enable-xray-stats.sh（幂等、可回滚）。
 # 谱系：交互逻辑基于上游 v20260710（r7），并叠加 2026-09 的加固修复。
 # 许可：MIT License — Copyright (c) 2026 shirasawatop（全文见仓库 LICENSE）
 # ============================================================================
@@ -54,7 +65,7 @@ if [ -f "$workdir/config.json" ]; then
     [ "$rerun_confirm" = "yes" ] || { echo "已取消"; exit 0; }
 fi
 
-echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.0.4${C_NC}"
+echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.1.0${C_NC}"
 echo ""
 echo "         _      _   __        _                   _ "
 echo "   ___  | |  __| | / _| _ __ (_)  ___  _ __    __| |"
@@ -168,6 +179,12 @@ vless_key_mode="mlkem768"
 vless_appearance="random"
 vless_rtt="0rtt"
 vless_ticket="600s"
+
+# 流量统计（Stats/API）相关变量（v1.1.0 新增）
+stats_enabled="yes"          # 是否启用统计；阶段 6.5 询问（回车默认 yes）
+apiport="10085"              # api 入站端口（仅回环 127.0.0.1，须 >1024 且 != portx）
+stats_intag="vless-in"       # 主 vless 入站 tag（决定计数键名 inbound>>>vless-in>>>...）
+stats_email="client-1"       # 首个客户端统计名（决定计数键名 user>>>client-1>>>...）
 
 echo ""
 
@@ -349,6 +366,62 @@ else
 fi
 
 # ============================================================
+# 阶段 6.5：流量统计（Stats/API）★ 询问，默认开启
+# ============================================================
+echo ""
+if command -v whiptail &>/dev/null; then
+    if ! whiptail --yesno "是否启用流量统计（按客户端 / 按入站查看用量）？\n\n· stats/api/policy + api 入站（仅监听 127.0.0.1）\n· 公网不可达，防火墙无需新增放行规则\n· 统计为内存态：重启 xray_service 后归零" 15 68; then
+        stats_enabled="no"
+    fi
+else
+    echo -e "${C_GREEN}是否启用流量统计（按客户端 / 按入站查看用量）？${C_NC}"
+    echo "  · stats/api/policy + api 入站（仅监听 127.0.0.1），公网不可达"
+    echo "  · 防火墙无需新增放行规则（加固模板已有 iif lo accept）"
+    echo "  · 统计为内存态：重启 xray_service 后归零"
+    read -rp "启用？(Y/n，默认 Y): " ans
+    [[ "$ans" =~ ^[Nn] ]] && stats_enabled="no" || stats_enabled="yes"
+fi
+
+if [ "$stats_enabled" = "yes" ]; then
+    read -rp "统计 API 端口（仅回环，默认 10085）: " input_apiport
+    [ -n "$input_apiport" ] && apiport="$input_apiport"
+    read -rp "客户端统计名 email（默认 client-1）: " input_statsemail
+    [ -n "$input_statsemail" ] && stats_email="$input_statsemail"
+
+    # --- 前置校验：数字 / 范围 / 与主监听端口冲突 / 已被占用 ---
+    case "$apiport" in ''|*[!0-9]*) echo -e "${C_RED}统计 API 端口必须是数字${C_NC}"; exit 1;; esac
+    if [ "$apiport" -lt 1024 ] || [ "$apiport" -gt 65535 ]; then
+        echo -e "${C_RED}统计 API 端口需在 1024-65535（>1024 才无需新增 CAP_NET_BIND_SERVICE）${C_NC}"
+        exit 1
+    fi
+    if [ "$apiport" = "$portx" ]; then
+        echo -e "${C_RED}统计 API 端口不能与主监听端口（$portx）相同${C_NC}"; exit 1
+    fi
+    # 被占用则向上寻找可用端口
+    # 例外（★ v1.1.0）：若占用者是**本机既有 xray**（重跑本脚本的场景），则不换端口
+    #   —— 阶段 18 的 restart 会释放该端口；否则每次重跑端口都会无谓 +1 漂移，
+    #   且与"统计已在运行、配置未变"的预期不符。
+    port_holder=$(ss -tlnp 2>/dev/null | awk -v p=":$apiport\$" '$4 ~ p' | grep -oP 'pid=\K[0-9]+' | head -1 || true)
+    if [ -n "$port_holder" ] && grep -qa "$workdir/xray" "/proc/$port_holder/cmdline" 2>/dev/null; then
+        echo -e "${C_YELLOW}端口 $apiport 当前由本机既有 xray（pid $port_holder）占用；阶段 18 重启服务即释放，端口保持不变${C_NC}"
+    elif [ -n "$port_holder" ]; then
+        orig_apiport="$apiport"
+        while ss -tln 2>/dev/null | awk -v p=":$apiport\$" '$4 ~ p {f=1} END{exit !f}'; do
+            apiport=$((apiport + 1))
+            if [ "$apiport" -gt 65535 ]; then
+                echo -e "${C_RED}无法为统计 API 找到可用端口${C_NC}"; exit 1
+            fi
+        done
+        echo -e "${C_YELLOW}端口 $orig_apiport 已被第三方进程占用，统计 API 改用 $apiport${C_NC}"
+    fi
+    echo "统计已启用: 127.0.0.1:$apiport | tag=$stats_intag | email=$stats_email"
+else
+    echo "流量统计已关闭（不生成 stats/api/policy 与 api 入站）"
+fi
+
+echo ""
+
+# ============================================================
 # 阶段 7：检查和依赖
 # ============================================================
 ping -c 2 8.8.8.8 &>/dev/null || ping -c 2 1.1.1.1 &>/dev/null || { echo "无网络连接"; exit 1; }
@@ -377,8 +450,17 @@ mkdir -p socket
 if [ "$protocol" = "reality" ]; then
     xray_x25519=$(./xray x25519)
     shortIds=$(openssl rand -hex 6)
-    private_old=$(echo "$xray_x25519" | grep "PrivateKey:" | cut -d' ' -f2-)
-    public_old=$(echo "$xray_x25519" | grep "Password:" | cut -d' ' -f2-)
+    # ★ 输出标签兼容（v1.1.0 修复；2026-09-21 实机复现）：
+    #   Xray 26.3.27 的输出为 "PrivateKey: xxx" / "Password (PublicKey): xxx" / "Hash32: xxx"，
+    #   而旧代码 `grep "Password:"` 在标签带后缀时会**取到空值**：实测生成的订阅链接
+    #   形如 `&pbk=&sid=...` ⇒ 公钥缺失，客户端**全部连不上**（而安装过程全部显示 ✓）。
+    #   故统一改用「行首标签(允许后缀): 值」的宽松解析，并显式校验取到值。
+    private_old=$(printf '%s\n' "$xray_x25519" | sed -n 's/^PrivateKey[^:]*: *//p' | head -1)
+    public_old=$(printf '%s\n' "$xray_x25519" | sed -n 's/^Password[^:]*: *//p' | head -1)
+    if [ -z "$private_old" ] || [ -z "$public_old" ]; then
+        echo -e "${C_RED}REALITY 密钥解析失败（xray x25519 输出格式可能已变更），终止安装${C_NC}"
+        exit 1
+    fi
     echo "REALITY 密钥已生成"
 else
     if [ "$vless_key_mode" = "mlkem768" ]; then
@@ -387,8 +469,13 @@ else
         enc_client_key=$(echo "$enc_output" | grep "Client:" | head -1 | awk '{print $2}')
     else
         x25519_output=$(./xray x25519)
-        enc_server_key=$(echo "$x25519_output" | grep "PrivateKey:" | cut -d' ' -f2-)
-        enc_client_key=$(echo "$x25519_output" | grep "Password:" | cut -d' ' -f2-)
+        # 同上：宽松解析，兼容 "Password (PublicKey):" 标签
+        enc_server_key=$(printf '%s\n' "$x25519_output" | sed -n 's/^PrivateKey[^:]*: *//p' | head -1)
+        enc_client_key=$(printf '%s\n' "$x25519_output" | sed -n 's/^Password[^:]*: *//p' | head -1)
+    fi
+    if [ -z "$enc_server_key" ] || [ -z "$enc_client_key" ]; then
+        echo -e "${C_RED}VLESS Encryption 密钥解析失败（xray 输出格式可能已变更），终止安装${C_NC}"
+        exit 1
     fi
     decryption_str="mlkem768x25519plus.${vless_appearance}.${vless_ticket}.${enc_server_key}"
     encryption_str="mlkem768x25519plus.${vless_appearance}.${vless_rtt}.${enc_client_key}"
@@ -413,41 +500,48 @@ generate_outbounds() {
 }
 
 generate_routing() {
-    local routing=""
+    # ★ 不变量（统计启用时）：api 路由规则必须是 rules 数组的**第一条**。
+    #   原因：下面生成的规则如 {"outboundTag":"direct-ipv4","ip":["0.0.0.0/0"]} 或
+    #   {"outboundTag":"direct-ipv6","network":"tcp,udp"} 都**不限定入站**，任何请求都会命中；
+    #   若 api 规则排在其后，本地 statsquery 请求会被交给 direct-* 出站（等于放行到公网），
+    #   api 服务永远收不到 ⇒ 统计静默失效。故此处统一把 api 规则拼在 rules 首位。
+    local api_rule='{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}'
+    local domain_strategy="IPIfNonMatch"
+    local rules=""
+
     if [[ -n "$ipv6_outbound" && -n "$ipv4_outbound" ]]; then
+        domain_strategy="IPOnDemand"
         if [[ "$use_ipv6_priority" == "yes" ]]; then
-            routing='
-    "routing": {
-        "domainStrategy": "IPOnDemand",
-        "rules": [
-            {"type": "field", "outboundTag": "direct-ipv6", "ip": ["2000::/3", "::/0"]},
-            {"type": "field", "outboundTag": "direct-ipv4", "ip": ["0.0.0.0/0"]}
-        ]
-    }'
+            rules='{"type": "field", "outboundTag": "direct-ipv6", "ip": ["2000::/3", "::/0"]},
+            {"type": "field", "outboundTag": "direct-ipv4", "ip": ["0.0.0.0/0"]}'
         else
-            routing='
-    "routing": {
-        "domainStrategy": "IPOnDemand",
-        "rules": [
-            {"type": "field", "outboundTag": "direct-ipv4", "ip": ["0.0.0.0/0"]},
-            {"type": "field", "outboundTag": "direct-ipv6", "ip": ["2000::/3", "::/0"]}
-        ]
-    }'
+            rules='{"type": "field", "outboundTag": "direct-ipv4", "ip": ["0.0.0.0/0"]},
+            {"type": "field", "outboundTag": "direct-ipv6", "ip": ["2000::/3", "::/0"]}'
         fi
     elif [[ -n "$ipv6_outbound" ]]; then
-        routing='
-    "routing": {
-        "domainStrategy": "IPIfNonMatch",
-        "rules": [{"type": "field", "outboundTag": "direct-ipv6", "network": "tcp,udp"}]
-    }'
+        rules='{"type": "field", "outboundTag": "direct-ipv6", "network": "tcp,udp"}'
     elif [[ -n "$ipv4_outbound" ]]; then
-        routing='
-    "routing": {
-        "domainStrategy": "IPIfNonMatch",
-        "rules": [{"type": "field", "outboundTag": "direct-ipv4", "network": "tcp,udp"}]
-    }'
+        rules='{"type": "field", "outboundTag": "direct-ipv4", "network": "tcp,udp"}'
     fi
-    echo "$routing"
+
+    if [ "$stats_enabled" = "yes" ]; then
+        if [ -n "$rules" ]; then
+            rules="$api_rule,
+            $rules"
+        else
+            rules="$api_rule"
+        fi
+    fi
+
+    [ -z "$rules" ] && return 0
+
+    echo "
+    \"routing\": {
+        \"domainStrategy\": \"$domain_strategy\",
+        \"rules\": [
+            $rules
+        ]
+    }"
 }
 
 # 落地方式
@@ -470,14 +564,34 @@ routing_config=$(generate_routing)
 
 # ============================================================
 # 阶段 11：配置生成（协议分支）
+# ------------------------------------------------------------
+# 统计相关片段：stats_enabled=no 时全部为空串 ⇒ 生成的 JSON 与 v1.0.4 完全等价。
+# api 入站仅监听 127.0.0.1（不写入 /var/xray，服务账户无需目录写权限）；
+# routing 中的 api 规则由阶段 10 的 generate_routing 置于首位（勿在此处补规则）。
 # ============================================================
+stats_top=""; stats_tag_line=""; stats_email_field=""; stats_api_inbound=""
+if [ "$stats_enabled" = "yes" ]; then
+    stats_top=',"stats": {},"api": {"tag": "api", "services": ["StatsService"]},"policy": {"levels": {"0": {"statsUserUplink": true, "statsUserDownlink": true}},"system": {"statsInboundUplink": true, "statsInboundDownlink": true,"statsOutboundUplink": true, "statsOutboundDownlink": true}}'
+    stats_tag_line="\"tag\": \"$stats_intag\","
+    stats_email_field=", \"email\": \"$stats_email\""
+    stats_api_inbound=", {
+    \"tag\": \"api\",
+    \"listen\": \"127.0.0.1\",
+    \"port\": $apiport,
+    \"protocol\": \"dokodemo-door\",
+    \"settings\": {\"address\": \"127.0.0.1\"}
+}"
+fi
+
 if [ "$protocol" = "reality" ]; then
     cat > config.json <<EOF
-{"log": {"loglevel": "warning"},"inbounds": [{
+{"log": {"loglevel": "warning"}$stats_top,
+  "inbounds": [{
+    $stats_tag_line
     "listen": "${workdir}/socket/xray.friend,0600",
     "protocol": "vless",
     "settings": {
-        "clients": [{"id": "$id_s","flow": "xtls-rprx-vision"}],
+        "clients": [{"id": "$id_s","flow": "xtls-rprx-vision"$stats_email_field}],
         "decryption": "none"
     },
     "streamSettings": {
@@ -490,25 +604,27 @@ if [ "$protocol" = "reality" ]; then
             "shortIds": ["$shortIds"]
         }
     }
-}],
+}$stats_api_inbound],
 "outbounds": $outbounds_config$( [[ -n "$routing_config" ]] && echo "," )$routing_config
 }
 EOF
 else
     cat > config.json <<EOF
-{"log": {"loglevel": "warning"},"inbounds": [{
+{"log": {"loglevel": "warning"}$stats_top,
+  "inbounds": [{
+    $stats_tag_line
     "port": $portx,
     "listen": "$ipaddr",
     "protocol": "vless",
     "settings": {
-        "clients": [{"id": "$id_s","flow": "xtls-rprx-vision"}],
+        "clients": [{"id": "$id_s","flow": "xtls-rprx-vision"$stats_email_field}],
         "decryption": "$decryption_str"
     },
     "streamSettings": {
         "network": "tcp",
         "security": "none"
     }
-}],
+}$stats_api_inbound],
 "outbounds": $outbounds_config$( [[ -n "$routing_config" ]] && echo "," )$routing_config
 }
 EOF
@@ -749,6 +865,8 @@ EOF
 done
 
 # help
+stats_help_line=""
+[ "$stats_enabled" = "yes" ] && stats_help_line='echo "xray.stats    流量统计（按客户端/按入站）"'
 cat > xrayhelp << EOF
 #!/bin/bash
 echo "========================================"
@@ -761,6 +879,7 @@ echo "xray.start    启动"
 echo "xray.restart  重启"
 echo "xray.status   查看状态"
 echo "xray.log      查看日志"
+${stats_help_line}
 echo "xray.help     帮助"
 echo "========================================"
 EOF
@@ -782,11 +901,37 @@ cat > xraylog << EOF
 journalctl -u xray_service -n 50 --no-pager "\$@"
 EOF
 
-chmod 755 chaguuid delxray xraystop xraystart xrayrestart xrayhelp xraystatus xraylog 2>/dev/null
+# stats（v1.1.0；仅统计启用时生成）
+# 说明：xraystats 不含内联密钥 ⇒ 755 root:root 即可（无需像 chaguuid 那样收 700）。
+if [ "$stats_enabled" = "yes" ]; then
+    cat >> xraystatus << EOF
+echo ""; echo "--- 流量统计 API 监听 ($apiport) ---"
+ss -tln 2>/dev/null | grep -E ':($apiport)\b' || echo "未检测到统计 API ($apiport) 监听"
+EOF
+
+    cat > xraystats << EOF
+#!/bin/bash
+# xraystats —— 查询 Xray 流量统计（StatsService，仅监听 127.0.0.1:$apiport）
+# 用法:
+#   xray.stats              查看全部统计项
+#   xray.stats user         仅按客户端（email）统计
+#   xray.stats inbound      仅按入站统计
+#   xray.stats user -r      读取后清零（适用于周期差值采集）
+# 说明: 统计为内存态，重启 xray_service 后归零；长期留存请另加定时落盘。
+PATTERN="\${1:-}"
+RESET="false"
+[ "\${2:-}" = "-r" ] && RESET="true"
+exec $workdir/xray api statsquery --server=127.0.0.1:$apiport -pattern "\$PATTERN" -reset="\$RESET"
+EOF
+fi
+
+mgmt_cmds="chaguuid delxray xraystop xraystart xrayrestart xrayhelp xraystatus xraylog"
+[ "$stats_enabled" = "yes" ] && mgmt_cmds="$mgmt_cmds xraystats"
+chmod 755 $mgmt_cmds 2>/dev/null
 chmod 700 chaguuid 2>/dev/null
 
 # 链接到 /usr/bin/ 和 /usr/local/bin/
-for cmd in chaguuid delxray xraystop xraystart xrayrestart xrayhelp xraystatus xraylog; do
+for cmd in $mgmt_cmds; do
     linkname="${cmd#xray}"; [ "$linkname" = "$cmd" ] && linkname="$cmd"
     ln -sf $workdir/$cmd /usr/bin/xray.$linkname 2>/dev/null
     ln -sf $workdir/$cmd /usr/local/bin/xray.$linkname 2>/dev/null
@@ -797,7 +942,15 @@ done
 # ============================================================
 systemctl daemon-reload
 systemctl enable xray_service
-systemctl start xray_service
+# ★ 必须用 restart 而非 start（v1.1.0 修复；2026-09-21 实机复现）：
+#   `systemctl start` 对**已 active** 的单元是 no-op。本脚本支持"在已有部署上重跑"
+#   （前置检查会提示并确认），此时旧实例仍在运行 ⇒ 新 config.json 不会被加载：
+#   进程继续用**旧 UUID/旧密钥/旧 api 端口**，而阶段 21 打印的是**新订阅链接**
+#   ⇒ 客户端全部连不上，且阶段 19 的端口检查会因旧进程监听而"假成功"。
+#   实测证据：ActiveEnterTimestamp(21:33:02) 早于 config.json mtime(21:40)，
+#   新 api 端口 10086 未监听、statsquery 失败（即上述不一致）。
+#   restart 对未启动的单元等价于 start，故新装/重跑两种场景均正确。
+systemctl restart xray_service
 if [ "$ddns_enabled" = "yes" ]; then
     systemctl enable --now xray-ddns.timer
 fi
@@ -817,12 +970,23 @@ fi
 if [ "$ddns_enabled" = "yes" ]; then
     systemctl is-active --quiet xray-ddns.timer && echo -e "${C_GREEN}[✓] DDNS 定时器运行中${C_NC}" || { echo -e "${C_RED}[✗] DDNS 定时器未运行${C_NC}"; verify_ok=0; }
 fi
+if [ "$stats_enabled" = "yes" ]; then
+    # 统计是「静默失败」型特性（路由顺序写错时端口在听、查询却不通），故必须实测查询
+    ss -tln 2>/dev/null | grep -q ":${apiport}\b" \
+        && echo -e "${C_GREEN}[✓] 统计 API 已监听 127.0.0.1:${apiport}${C_NC}" \
+        || { echo -e "${C_RED}[✗] 统计 API 端口 ${apiport} 未监听${C_NC}"; verify_ok=0; }
+    "$workdir/xray" api statsquery --server="127.0.0.1:${apiport}" -pattern "" >/dev/null 2>&1 \
+        && echo -e "${C_GREEN}[✓] 统计 API 可查询（statsquery OK）${C_NC}" \
+        || { echo -e "${C_RED}[✗] 统计 API 不可查询（检查 routing 首位是否为 inboundTag[api]→api）${C_NC}"; verify_ok=0; }
+fi
 
 if [ $verify_ok -eq 0 ]; then
     echo ""
     echo -e "${C_YELLOW}排查命令:${C_NC}"
     echo "  systemctl status xray_service"
     echo "  journalctl -u xray_service -n 30"
+    [ "$stats_enabled" = "yes" ] && echo "  $workdir/xray api statsquery --server=127.0.0.1:$apiport -pattern ''"
+    echo "  grep -A3 '\"routing\"' $workdir/config.json    # api 规则须在 rules 首位"
 fi
 
 # ============================================================

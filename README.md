@@ -5,9 +5,10 @@
 
 | 项 | 值 |
 |---|---|
-| 当前版本 | **v1.0.4（2026-09-12）** |
+| 当前版本 | **v1.1.0（2026-09-21）** |
 | 目标系统 | Debian 12 / 13（systemd） |
 | 脚本 | [`xray-vless-reality-install.sh`](./xray-vless-reality-install.sh) |
+| 配套脚本 | [`enable-xray-stats.sh`](./enable-xray-stats.sh) —— 为**既有部署**幂等补装流量统计（可回滚，不重装） |
 | 安装目录 | `/var/xray` |
 | 运行用户 | `xrayuser`（`nologin`，仅用于运行服务） |
 | 许可 | [MIT](./LICENSE) © 2026 shirasawatop |
@@ -29,6 +30,8 @@
 - **systemd 集成**：`User=xrayuser` + `AmbientCapabilities=CAP_NET_BIND_SERVICE`（**不使用 `setcap`**）、`Restart=on-failure`。
 - **运行期文件自愈**：服务单元的 `ExecStartPre` 会在每次启动（含开机）重建 `xray.pid` / `sni-filter.pid` / `statusfilter` 并交还 `xrayuser` —— 配合「目录收归 `root`」，误删也不会卡住服务。
 - 可选：IPv4/IPv6 出口选择与优先顺序、DDNS 检测脚本、MTU 调整（经 unit 的 `ExecStartPre` 生效）、socks5 落地。
+- **流量统计（v1.1.0，安装时询问 / 默认开启）**：生成 `stats` + `api(StatsService)` + `policy`（用户级与入站级计数）、api 入站（**仅监听 `127.0.0.1:<apiport>`，默认 10085**，公网不可达）、主入站 `tag`（默认 `vless-in`）与首个客户端 `email`（默认 `client-1`）—— 之后用 `xray.stats` 即可查看用量。**关闭该项则完全不生成相关配置**（与 v1.0.4 等价）。
+- **API 路由规则置于 `routing.rules` 首位**（不变量）：脚本生成的 `direct-ipv4/ipv6` 规则**不限定入站**，若 api 规则排在其后会被截走 ⇒ 统计**静默失效**；故安装收尾会**实测** `statsquery`（端口在听 ≠ 查询可用）。
 
 ## 环境要求
 
@@ -71,6 +74,9 @@ bash /root/xray-vless-reality-install.sh
 | 6d | **Encryption 专属**：外观 | `native` | `native` / `xorpub` / `random`（越靠后越隐蔽） |
 | 6e | **Encryption 专属**：RTT | `0rtt` | `0rtt`（更快）/ `1rtt`（更安全） |
 | 6f | **Encryption 专属**：Ticket 时长 | `600`（秒） | 仅 `0rtt` 模式生效 |
+| 6.5 | **是否启用流量统计** | `Y`（**默认开启**） | `Y` → 追加 `stats`/`api`/`policy` 与 api 入站（**仅 `127.0.0.1`**）；`n` → 完全不生成（等价 v1.0.4） |
+| 6.5a | 统计 API 端口 | `10085` | 仅回环监听；校验 >1024 且 ≠ 主监听端口；被**第三方**占用则自动向上找空位（占用者是**本机既有 xray** 时保持端口，阶段 18 重启即释放） |
+| 6.5b | 客户端统计名 `email` | `client-1` | 决定计数键名 `user>>>client-1>>>traffic>>>…`；主入站 `tag` 固定为 `vless-in` |
 | 7 | 落地方式 | — | `直接落地` / `socks5 落地`（后者需填 IP、端口、用户、密码） |
 
 > 小贴士：`apt-get install -y whiptail` 可获得对话框式交互，避免长选项敲错。
@@ -105,9 +111,12 @@ bash /root/xray.sh
 | `监听端口 (默认443):` | 回车 | 443 需要 `CAP_NET_BIND_SERVICE`（脚本已处理） |
 | `伪装域名 (默认www.fastly.com):` | 回车 或 **`tesla.com`** | 回车即用默认 `www.fastly.com`；也可填你自测可用的站点（见下方说明） |
 | `选择 (默认 chrome):` | 回车 | 客户端指纹 `fp` |
+| `启用？(Y/n，默认 Y):` | 回车 | **流量统计默认开启**（回车即启用；答 `n` 则完全不生成） |
+| `统计 API 端口（仅回环，默认 10085）:` | 回车 | 仅 `127.0.0.1` 可达，公网不可达 |
+| `客户端统计名 email（默认 client-1）:` | 回车 | 决定计数键名 `user>>>client-1>>>…` |
 | `选择落地方式:` | `1` | 1 = 直接落地 |
 
-结束时脚本会打印：`[✓]` 四项自检 + **IPv4 订阅链接** + 管理命令清单。
+结束时脚本会打印：`[✓]` **六项**自检（v1.1.0 起含「统计 API 已监听」与「`statsquery` 实测可查询」）+ **IPv4 订阅链接** + 管理命令清单。
 
 > **伪装域名（`dest`）怎么选**
 >
@@ -224,6 +233,7 @@ bash /root/xray.sh
 | `encryption_key.txt` | `600` | `root:root` | 仅 Encryption 形态 |
 | `chaguuid` | `700` | `root:root` | **内联客户端订阅参数**，故仅 root 可读 |
 | `xray{start,stop,restart,help,status,log}`、`delxray` | `755` | `root:root` | 管理脚本 |
+| `xraystats` | `755` | `root:root` | **仅启用流量统计时生成**；查询用量（不含内联密钥，故无需 `700`） |
 | `socket/`、`xray.pid`、`sni-filter.pid`、`statusfilter` | — | `xrayuser:xrayuser` | 运行期产物 |
 | 目录 `/var/xray` | `755` | **`root:root`** | 安装收尾（阶段 20）收归 `root`：服务账户不再能重建目录内文件；运行期需写的文件已预建并留给 `xrayuser` |
 
@@ -245,9 +255,49 @@ bash /root/xray.sh
 | `xray.status` | 查看服务状态、端口监听与两个进程 |
 | `xray.start` / `xray.stop` / `xray.restart` | 启停 / 重启服务 |
 | `xray.log` | 最近 50 行服务日志（支持 `-f` 等 `journalctl` 参数） |
+| `xray.stats` | **流量统计查询**（v1.1.0，启用统计时才有）：`xray.stats` / `xray.stats user` / `xray.stats inbound` / `xray.stats user -r`（读后清零） |
 | `xray.chaguuid` | **更换客户端 UUID**（改 `config.json` 并重启，随后打印新订阅链接） |
 | `xray.help` | 命令一览 |
 | `xray.delxray` | **卸载**（停止并禁用服务、删除 `/var/xray` 与 `xrayuser`；需输入 `yes` 确认） |
+
+## 流量统计（v1.1.0+）
+
+安装时选择启用（**默认开启**）后，`config.json` 会多出 `stats` / `api` / `policy` 三项、一个**仅回环**的 api 入站，以及主入站 `tag` 与客户端 `email`；随后即可按客户端、按入站查看用量：
+
+```bash
+xray.stats              # 全部统计项（JSON）
+xray.stats user         # 仅按客户端（email）
+xray.stats inbound      # 仅按入站
+xray.stats user -r      # 读取后清零（适合做周期差值采集）
+```
+
+计数键名（`user>>>` 为**纯载荷**口径，`inbound>>>` 更接近网络字节）：
+
+| 键 | 含义 |
+|---|---|
+| `user>>>client-1>>>traffic>>>uplink/downlink` | 该客户端的**载荷**收发（业务报表用这个） |
+| `inbound>>>vless-in>>>traffic>>>uplink/downlink` | 主入站收到的字节（含 VLESS/REALITY 协议头，与网卡口径更接近） |
+| `inbound>>>api>>>traffic>>>…` | 统计查询自身产生的流量（可忽略） |
+| `outbound>>>direct-…>>>traffic>>>…` | 各出口的出站量 |
+
+> ⚠️ **统计是内存态**：重启 `xray_service` 即归零，脚本**不做任何落盘**。需要长期留存/月报请自加定时采集，例如：
+>
+> ```bash
+> # root 的 cron（示例：每分钟落盘一次并清零）
+> * * * * * root /var/xray/xraystats -r > /var/log/xray-stats/$(date +\%Y\%m\%d\%H\%M).json
+> ```
+
+> **既有部署补装统计**：不想重装（重装会换密钥/UUID）时用配套脚本 —— 幂等、自动备份、写入前打印差异、失败**自动回滚**，并带**真实流量端到端自测**：
+>
+> ```bash
+> ./enable-xray-stats.sh --check      # 只体检，不做任何改动
+> ./enable-xray-stats.sh --dry-run    # 预览将要写入的差异
+> ./enable-xray-stats.sh -y           # 执行（-p 改端口 / -e 改统计名 / -w 改工作目录）
+> ./enable-xray-stats.sh --reformat -y   # 仅重排为规范形态（语义等价断言后不重启）
+> ./enable-xray-stats.sh --rollback   # 回滚到最近一次备份并重启
+> ```
+>
+> 两种形态（REALITY / VLESS Encryption）自动识别；`--check` 也可用于日常巡检「统计是否仍然生效」。
 
 ## 订阅链接
 
@@ -276,6 +326,11 @@ stat -c '%n %a %U:%G' /var/xray/xray /var/xray/sni-filter /var/xray/config.json 
 # 运行期文件自愈（v1.0.4+）：删掉后重启应自动重建并归属 xrayuser
 rm -f /var/xray/xray.pid && systemctl restart xray_service && ls -l /var/xray/xray.pid
 
+# 流量统计（v1.1.0+，启用时）
+ss -tlnp | grep ':10085\b'                                      # api 仅监听 127.0.0.1
+/var/xray/xray api statsquery --server=127.0.0.1:10085 -pattern ''   # 或直接 xray.stats
+python3 -c "import json;print(json.load(open('/var/xray/config.json'))['routing']['rules'][0])"   # api 规则须在首位
+
 # DDNS 定时器（仅启用 DDNS 时存在）
 systemctl list-timers xray-ddns.timer 2>/dev/null || echo "未启用 DDNS"
 ```
@@ -287,6 +342,8 @@ systemctl list-timers xray-ddns.timer 2>/dev/null || echo "未启用 DDNS"
 | REALITY 形态看不到 `xray` 监听 443 | **正常**：443 由 `sni-filter` 监听，xray 走 unix socket |
 | 客户端连不上 | 核对链接里的 `uuid`、`sni/host`、`pbk`、`sid`、`fp` 是否与安装输出一致；确认客户端时间准确 |
 | 重跑安装脚本后客户端全失效 | 预期行为：重跑会**重新生成密钥与 UUID**（脚本已二次确认）；请用新链接更新客户端 |
+| `xray.stats` 报 `failed to dial 127.0.0.1:10085` | 统计未启用或端口被改：`ss -tlnp \| grep 10085`；核对 `config.json` 的 api 入站端口与查询命令是否一致 |
+| 统计项一直是空值 | 检查 `routing.rules[0]` 是否为 `{"inboundTag":["api"],"outboundTag":"api"}` —— 该规则**必须在首位**，否则查询会被 `direct-*` 规则截走 |
 
 ## 安全说明
 
@@ -325,8 +382,25 @@ xray.delxray            # 需输入 yes 确认；会停止服务、禁用开机�
    chown root:xrayuser /var/xray/config.json && chmod 640 /var/xray/config.json
    ```
 7. **DDNS 刻意以 root 运行**（`xray-ddns.timer` → `ddns_check.sh`）：这样 `/var/xray` 才能保持 `root:root` 收口。若你改成非 root 运行，需自行放宽目录权限（不建议，会重新打开「低权账户可 unlink + 重建 root 文件」的完整性面）。
+8. **流量统计为内存态**：重启服务即归零，脚本**不落盘**；要长期留存请自加定时采集（见「流量统计（v1.1.0+）」一节）。
+9. 统计的 api 入站固定绑定 **`127.0.0.1`**（有意为之：不暴露公网、无需改防火墙）。需要远程拉取统计时请用 SSH 隧道（`ssh -L 10085:127.0.0.1:10085 <user>@<host>`），**不要**改成 `0.0.0.0`。
+10. 统计依赖两条**手工编辑易破坏**的不变量：① `routing.rules[0]` 必须是 api 规则；② api 入站 `port` 须与查询命令一致。改完配置请务必 `xray.restart` 后执行 `xray.stats` 实测。
+11. 统计**只反映本机 xray 的用量**（不是网卡口径）；与 `vnstat` 等网卡统计对账时请用 `inbound>>>` 键，二者仍会因重传/协议开销存在几个百分点的差异。
 
 ## 变更记录
+
+**v1.1.0（2026-09-21）**
+
+- **新增「流量统计（Stats/API）」**：安装时询问、**默认开启**。生成 `stats` + `api(StatsService)` + `policy`（`statsUserUplink/Downlink` 与 `statsInbound/Outbound*`）、一个**仅回环**的 api 入站（`127.0.0.1:<apiport>`，默认 `10085`），并给主入站加 `tag`（默认 `vless-in`）、给首个客户端加 `email`（默认 `client-1`）⇒ 计数键名可读。
+  - **不变量**：api 路由规则必须位于 `routing.rules` **首位**。脚本生成的 `direct-ipv4/ipv6` 规则**不限定入站**，若 api 规则排在其后会截走本地查询 ⇒ 统计**静默失效**。`generate_routing()` 已改为统一在首位拼接 api 规则。
+  - 新增管理命令 **`xray.stats`**（`xraystats`，`755 root:root`，不含内联密钥）；`xrayhelp` / `xraystatus` 同步展示统计端口。
+  - 阶段 19 新增**两项实测自检**（api 端口监听 + `statsquery` 可查询）—— 该特性属于「端口在听但查询不通」的**静默失败型**，只查端口不够。
+- **修复：重跑安装时新配置不被加载**（严重，实机复现）—— 阶段 18 原用 `systemctl start`，对**已 active** 的单元是 no-op：在已有部署上重跑（脚本明确支持、且提示需答 `yes`）后，进程继续使用**旧 UUID/密钥/api 端口**，而阶段 21 打印的是**新订阅链接** ⇒ 客户端全部连不上，且端口检查会因旧进程监听而「假成功」。**改为 `systemctl restart`**（对未启动单元等价于 start，新装/重跑均正确）。
+- **修复：REALITY 订阅链接 `pbk` 为空**（严重，实机复现）—— Xray 26.3.27 的 `xray x25519` 输出标签已变为 `Password (PublicKey):`，而旧代码 `grep "Password:"` 取不到值 ⇒ 链接形如 `&pbk=&sid=…`，**客户端全部连不上**（而安装过程全部显示 ✓）。改为「行首标签(允许后缀): 值」的宽松解析并**显式校验非空**（REALITY 与 Encryption-x25519 分支均已修正，解析失败即终止安装）。
+- **统计 API 端口占用处理**：被**第三方**进程占用时自动向上寻找空位；占用者是**本机既有 xray**（重跑场景）时保持端口不变（阶段 18 的 restart 会释放），避免每次重跑端口 +1 漂移。
+- **新增配套脚本 [`enable-xray-stats.sh`](./enable-xray-stats.sh)**：为既有部署**幂等**补装统计（自动备份、写入前差异预览、失败**自动回滚**、真实流量端到端自测），支持 `--check` / `--dry-run` / `--rollback`，自动识别两种形态。
+- **校验记录**：在 Debian 13 实机完成 **REALITY 与 VLESS Encryption 两种形态的完整安装 + 重跑覆盖**验证（阶段 19 全部 ✓；真实流量自测 HTTP 204 且 `user>>>` 计数非零；`pbk` 与由 `privateKey` 派生的公钥一致；`xray.stats` 返回全部 10 个计数键）。
+- 头部「权限模型」注释、README（特性 / 交互流程 / 例 1 / 生成物 / 管理命令 / 新增「流量统计」节 / 排障 / 已知限制）同步更新。
 
 **v1.0.4（2026-09-12）**
 
