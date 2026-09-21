@@ -1,6 +1,12 @@
 #!/bin/bash
 # ============================================================================
-# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.1.0 (2026-09-21)
+# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.1.1 (2026-09-21)
+# ----------------------------------------------------------------------------
+# v1.1.1 修复（严重，实机复现）：`set -e` + 命令替换内 grep 链**无匹配**会返回 1，
+#   使脚本在「阶段 1 检测 IP」处**静默退出**（stderr 被 2>/dev/null 丢弃，界面只显示
+#   "正在检测系统网络配置..."后回到提示符）。**无公网 IPv6 的主机必然命中**
+#   （eth0 只有 fe80 链路本地）——已为 IPv4/IPv6 检测与密钥解析加 `|| true` / 改宽松解析。
+#   附：新增 NAT 型 VPS 提示（网卡只有私网地址时，提醒「监听IP 保持 0.0.0.0」）。
 # ----------------------------------------------------------------------------
 # 功能：交互式部署 Xray 服务端，二选一：
 #   ① REALITY（+ sni-filter：443 由 sni-filter 监听，xray 走 unix socket）
@@ -65,7 +71,7 @@ if [ -f "$workdir/config.json" ]; then
     [ "$rerun_confirm" = "yes" ] || { echo "已取消"; exit 0; }
 fi
 
-echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.1.0${C_NC}"
+echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.1.1${C_NC}"
 echo ""
 echo "         _      _   __        _                   _ "
 echo "   ___  | |  __| | / _| _ __ (_)  ___  _ __    __| |"
@@ -122,18 +128,22 @@ detect_ips() {
     
     for iface in $interfaces; do
         [[ "$iface" == "lo" || "$iface" == docker* || "$iface" == br-* || "$iface" == veth* ]] && continue
-        ipv4_list=$(ip -4 addr show $iface 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+        # ★ v1.1.1 修复（严重）：命令替换末尾必须加 `|| true`。
+        #   `set -e` 下，若替换内的 grep 链**无匹配**则返回 1 ⇒ 整条赋值失败 ⇒ 脚本**静默退出**
+        #   （stderr 已被 2>/dev/null 丢弃，用户看不到任何报错，只看到"正在检测系统网络配置..."后回到提示符）。
+        #   实测：无公网 IPv6 的主机（只有 fe80 链路本地）在下面的 IPv6 分支必然命中。
+        ipv4_list=$(ip -4 addr show $iface 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || true)
         for ipv4 in $ipv4_list; do
             ipv4_addresses+=("$ipv4")
             ipv4_interfaces+=("$iface: $ipv4")
         done
     done
-    
+
     ipv6_addresses=()
     ipv6_interfaces=()
     for iface in $interfaces; do
         [[ "$iface" == "lo" || "$iface" == docker* || "$iface" == br-* || "$iface" == veth* ]] && continue
-        ipv6_list=$(ip -6 addr show $iface 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-f:]+' | grep -v '^fe80:' | grep -v '^::1')
+        ipv6_list=$(ip -6 addr show $iface 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-f:]+' | grep -v '^fe80:' | grep -v '^::1' || true)
         for ipv6 in $ipv6_list; do
             ipv6_addresses+=("$ipv6")
             ipv6_interfaces+=("$iface: $ipv6")
@@ -156,6 +166,18 @@ detect_ips() {
         for i in "${!ipv6_interfaces[@]}"; do
             echo "  [$((i+1))] ${ipv6_interfaces[$i]}"
         done
+    fi
+
+    # ★ v1.1.1 新增：云厂商 NAT 型 VPS 的提示（网卡上只有私网地址，公网 IP 由 NAT 映射）
+    if [ ${#ipv4_addresses[@]} -eq 0 ] && [ ${#ipv6_addresses[@]} -eq 0 ]; then
+        echo -e "${C_YELLOW}提示：未检测到任何地址，请确认 ip 命令可用与本机网络配置。${C_NC}"
+    elif ! ip -4 addr show scope global 2>/dev/null | grep -qE 'inet (10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)'; then
+        :  # 公网地址直接落在网卡上，无需提示
+    else
+        echo -e "${C_YELLOW}提示：检测到的地址看起来是私网（云厂商 NAT 型 VPS）。此时请务必：${C_NC}"
+        echo -e "${C_YELLOW}  · 后续「监听IP」保持默认 0.0.0.0（**不要**填公网 IP——它不在网卡上，绑定会失败）${C_NC}"
+        echo -e "${C_YELLOW}  · 出口地址可选私网地址（sendThrough 用真实网卡地址，出网仍经 NAT）${C_NC}"
+        echo -e "${C_YELLOW}  · 订阅链接里的公网 IP 由 cloudflare 探测得到，不受影响${C_NC}"
     fi
     echo ""
 }
@@ -465,8 +487,9 @@ if [ "$protocol" = "reality" ]; then
 else
     if [ "$vless_key_mode" = "mlkem768" ]; then
         enc_output=$(./xray mlkem768)
-        enc_server_key=$(echo "$enc_output" | grep "Seed:" | head -1 | awk '{print $2}')
-        enc_client_key=$(echo "$enc_output" | grep "Client:" | head -1 | awk '{print $2}')
+        # 宽松解析（v1.1.1）：同样避免 `set -e` 下 grep 无匹配导致静默退出
+        enc_server_key=$(printf '%s\n' "$enc_output" | sed -n 's/^Seed[^:]*: *//p' | head -1)
+        enc_client_key=$(printf '%s\n' "$enc_output" | sed -n 's/^Client[^:]*: *//p' | head -1)
     else
         x25519_output=$(./xray x25519)
         # 同上：宽松解析，兼容 "Password (PublicKey):" 标签
