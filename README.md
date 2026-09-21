@@ -9,6 +9,7 @@
 | 目标系统 | Debian 12 / 13（systemd） |
 | 脚本 | [`xray-vless-reality-install.sh`](./xray-vless-reality-install.sh) |
 | 配套脚本 | [`enable-xray-stats.sh`](./enable-xray-stats.sh) —— 为**既有部署**幂等补装流量统计（可回滚，不重装） |
+| 自检工具 | [`ipcheck.sh`](./ipcheck.sh) —— 判定"公网 IP 是否真的在网卡上"（直配网卡 / 1:1 NAT·EIP），**只读**，支持 `--json` |
 | 安装目录 | `/var/xray` |
 | 运行用户 | `xrayuser`（`nologin`，仅用于运行服务） |
 | 许可 | [MIT](./LICENSE) © 2026 shirasawatop |
@@ -299,6 +300,38 @@ xray.stats user -r      # 读取后清零（适合做周期差值采集）
 >
 > 两种形态（REALITY / VLESS Encryption）自动识别；`--check` 也可用于日常巡检「统计是否仍然生效」。
 
+## 公网 IP 归属自检（`ipcheck.sh`）
+
+**为什么需要**：在 **1:1 NAT / 弹性公网 IP（EIP）** 型 VPS 上，公网 IP 由云平台持有、**不在 guest 网卡上**。此时任何 `bind()` 公网 IP 的配置都会失败 —— 典型现象是**入口一切正常（443 在听、REALITY 能握手、日志有 `vless-in` 记录），但打不开任何网页、客户端延迟 `-1`**（根因通常是出站 `sendThrough` 被写成了公网 IP）。
+
+```bash
+./ipcheck.sh          # 人类可读报告（判定 + 建议）
+./ipcheck.sh --json   # 机器可读（机队批量采集）
+```
+
+它只做**只读**检查，输出三类判定之一：
+
+| 判定 | 含义 | 输出示例 |
+|---|---|---|
+| `direct` / `direct-like` | 公网 IP **就在网卡上**（可 `bind`） | lycheen：`<公网IP> 出现在本机网卡地址中` |
+| `eip` / `eip-by-gw` | **1:1 NAT / EIP**：公网 IP 独享但不在网卡上 | sadidc：`<公网IP> 不在本机网卡上，内核也不接受其作为源地址` |
+| `unknown` | 探测失败（网络受限/无 wget），仅给出本地事实 | 退出码 `1` |
+
+判定依据（都可手工复核，见下）：① 地址是否出现在 `ip -o addr show`；② 能否作为源地址（`ip route get <目标> from <地址>`，等价于能否 `bind`，**不依赖 python**）；③ 默认网关是公网还是私网。
+
+**结论对应的硬约束**（安装脚本 v1.1.2 起会自动校验，见「排障」）：
+
+- `sendThrough`（出站源地址）：只能填**网卡上 `scope global` 的地址**，或**留空**（推荐）
+- 监听 IP：必须用 `0.0.0.0` —— **绝不要**填公网 IP
+- ⚠️ 安全含义：云侧**不在边缘挡端口**，入向未监听端口的 SYN 也会到达虚机（只是回程被丢）⇒ **nftables 才是唯一防线**；对外探测时「关闭端口」表现为 **timeout 而非 refused**
+
+> 手工复核（等价于脚本内的判据）：
+> ```bash
+> ip -o addr show | awk '{print $2,$3,$4}'                  # ① 内核是否持有该地址
+> ip route get 1.1.1.1 from <公网IP> | head -1               # ② 报 unreachable ⇒ 不可 bind
+> ip route | grep default                                    # ③ 私网网关 ⇒ EIP 特征
+> ```
+
 ## 订阅链接
 
 安装结束与执行 `xray.chaguuid` 时会打印（`<…>` 为占位）：
@@ -348,6 +381,8 @@ systemctl list-timers xray-ddns.timer 2>/dev/null || echo "未启用 DDNS"
 | **NAT 型 VPS（网卡只有私网地址，如 `10.x`/`172.16-31.x`/`192.168.x`）** | 检测到的 IPv4 是**私网地址**：① 「监听IP」务必保持 `0.0.0.0`（填公网 IP 会绑定失败）；② 出口地址选「使用检测到的地址」（私网即可，出网经 NAT）；③ 订阅链接里的公网 IP 由 `cloudflare.com/cdn-cgi/trace` 探测，不受影响（v1.1.1 起脚本会在检测阶段主动提示） |
 | **节点延迟 `-1` / 能握手但打不开任何网页**（v1.1.1 及更早） | 典型原因是**出站 `sendThrough` 指向了不在网卡上的地址**（例如在 NAT 型 VPS 上把「IPv4 出口」手输成公网 IP）：入口一切正常（443 在听、REALITY 握手成功、日志有 `vless-in` 记录），但每条出站连接在 `bind()` 阶段失败（`Cannot assign requested address`）。<br>**判据**：`python3 -c "import json;print(json.load(open('/var/xray/config.json'))['outbounds'])"` 看 `sendThrough` 是否等于公网 IP；`ip -4 addr show scope global` 看它是否真在网卡上。<br>**修复**：删掉该字段（交回内核自选）或改为网卡上的地址，然后 `xray -test` 预检 + `xray.restart`。v1.1.2 起脚本会在「手动输入出口地址」处直接拦截，并在阶段 19 增加出站源地址自检 |
 
+| **不确定本机是「公网 IP 直配网卡」还是「1:1 NAT / EIP」** | 跑只读自检 **`./ipcheck.sh`**（`--json` 可机读）：判定 `direct` = 公网 IP 在网卡上、可 `bind`；判定 `eip` = 公网 IP **不在网卡上** ⇒ `sendThrough` 只能填网卡地址或**留空**、监听 IP 用 `0.0.0.0`。判据与手工复核命令见「公网 IP 归属自检」一节 |
+
 ## 安全说明
 
 - **不做任何数据回传/遥测**。脚本只访问：`github.com`（Xray 与 sni-filter 发布页）、`cloudflare.com`（探测公网 IP）。
@@ -391,6 +426,16 @@ xray.delxray            # 需输入 yes 确认；会停止服务、禁用开机�
 11. 统计**只反映本机 xray 的用量**（不是网卡口径）；与 `vnstat` 等网卡统计对账时请用 `inbound>>>` 键，二者仍会因重传/协议开销存在几个百分点的差异。
 
 ## 变更记录
+
+**新增工具 `ipcheck.sh`（2026-09-21；安装脚本本身未变更，仍为 v1.1.2）**
+
+- 新增**只读**自检工具 [`ipcheck.sh`](./ipcheck.sh)：判定本机是「公网 IP 直配网卡」还是「**1:1 NAT / 弹性公网 IP（EIP）**」，并输出 `sendThrough` / 监听 IP 的硬约束建议。
+  - 无第三方依赖（仅 `ip` 与 `wget`）；**判定不依赖 python**：用 `ip route get <目标> from <地址>` 作为 `bind()` 的等价检查（源地址非本机时报 `Network is unreachable`，已在 Debian 13/iproute2 实测）
+  - 支持 `--json`（便于机队批量采集）；退出码：`0`=已判定、`1`=探测失败（仅给本地事实）
+  - **刻意不使用 `set -e`** —— 探测类命令与 `set -e` 组合正是历史多次「静默退出」的根因（见 v1.1.1）
+- 动机：v1.1.2 修复的「节点延迟 -1」事故，根因是出站 `sendThrough` 指向了不在网卡上的公网 IP；该工具用于**装机后 / 排障时 10 秒内判型**。
+- 实测：**sadidc → `eip`**（`<公网IP> 不在本机网卡上，内核也不接受其作为源地址`）；**lycheen → `direct`**（`<公网IP> 出现在本机网卡地址中`）。
+- README：新增「公网 IP 归属自检」一节；版本表新增「自检工具」行；排障表新增「不确定本机是否 EIP」条目。
 
 **v1.1.2（2026-09-21）**
 
