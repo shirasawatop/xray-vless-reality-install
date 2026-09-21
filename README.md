@@ -344,7 +344,7 @@ systemctl list-timers xray-ddns.timer 2>/dev/null || echo "未启用 DDNS"
 | 重跑安装脚本后客户端全失效 | 预期行为：重跑会**重新生成密钥与 UUID**（脚本已二次确认）；请用新链接更新客户端 |
 | `xray.stats` 报 `failed to dial 127.0.0.1:10085` | 统计未启用或端口被改：`ss -tlnp \| grep 10085`；核对 `config.json` 的 api 入站端口与查询命令是否一致 |
 | 统计项一直是空值 | 检查 `routing.rules[0]` 是否为 `{"inboundTag":["api"],"outboundTag":"api"}` —— 该规则**必须在首位**，否则查询会被 `direct-*` 规则截走 |
-| **脚本在「正在检测系统网络配置...」后直接退出提示符**（v1.1.0 及更早） | 已知缺陷（v1.1.1 已修）：`set -e` + 命令替换内 `grep` 链**无匹配**返回 1 ⇒ 静默退出。**无公网 IPv6 的主机必然命中**（只有 `fe80` 链路本地）。应急热修：把阶段 1 的两行末尾加 `|| true`，即<br>`ipv4_list=$(ip -4 addr show $iface 2>/dev/null \| grep -oP '(?<=inet\s)\d+(\.\d+){3}' \|\| true)`<br>`ipv6_list=$(... \| grep -v '^::1' \|\| true)`<br>或直接升级到 v1.1.1 |
+| **脚本在「正在检测系统网络配置...」后直接退出提示符**（v1.1.0 及更早） | 已知缺陷（v1.1.1 已修）：`set -e` + 命令替换内 `grep` 链**无匹配**返回 1 ⇒ 静默退出。**无公网 IPv6 的主机必然命中**（只有 `fe80` 链路本地）。<br>**应急热修（两条，已实机验证）**：<br>`sed -i '/^ *ipv4_list=/ s/)$/ \|\| true)/' /root/xray-vless-reality-install.sh`<br>`sed -i '/^ *ipv6_list=/ s/)$/ \|\| true)/' /root/xray-vless-reality-install.sh`<br>然后 `grep -n '_list=' /root/xray-vless-reality-install.sh` 确认两行行尾均带 `\|\| true`、`bash -n` 通过；或直接升级到 v1.1.1 |
 | **NAT 型 VPS（网卡只有私网地址，如 `10.x`/`172.16-31.x`/`192.168.x`）** | 检测到的 IPv4 是**私网地址**：① 「监听IP」务必保持 `0.0.0.0`（填公网 IP 会绑定失败）；② 出口地址选私网地址即可（`sendThrough` 用真实网卡地址，出网经 NAT）；③ 订阅链接里的公网 IP 由 `cloudflare.com/cdn-cgi/trace` 探测，不受影响（v1.1.1 起脚本会在检测阶段主动提示） |
 
 ## 安全说明
