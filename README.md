@@ -5,7 +5,7 @@
 
 | 项 | 值 |
 |---|---|
-| 当前版本 | **v1.1.2（2026-09-21）** |
+| 当前版本 | **v1.1.3（2026-09-21）** ｜ 安装脚本自身版本 **v1.1.2**（v1.1.3 仅新增自检工具 `ipcheck.sh` 与可执行位修正，**脚本未变更**） |
 | 目标系统 | Debian 12 / 13（systemd） |
 | 脚本 | [`xray-vless-reality-install.sh`](./xray-vless-reality-install.sh) |
 | 配套脚本 | [`enable-xray-stats.sh`](./enable-xray-stats.sh) —— 为**既有部署**幂等补装流量统计（可回滚，不重装） |
