@@ -5,7 +5,7 @@
 
 | 项 | 值 |
 |---|---|
-| 当前版本 | **v1.1.1（2026-09-21）** |
+| 当前版本 | **v1.1.2（2026-09-21）** |
 | 目标系统 | Debian 12 / 13（systemd） |
 | 脚本 | [`xray-vless-reality-install.sh`](./xray-vless-reality-install.sh) |
 | 配套脚本 | [`enable-xray-stats.sh`](./enable-xray-stats.sh) —— 为**既有部署**幂等补装流量统计（可回滚，不重装） |
@@ -345,7 +345,8 @@ systemctl list-timers xray-ddns.timer 2>/dev/null || echo "未启用 DDNS"
 | `xray.stats` 报 `failed to dial 127.0.0.1:10085` | 统计未启用或端口被改：`ss -tlnp \| grep 10085`；核对 `config.json` 的 api 入站端口与查询命令是否一致 |
 | 统计项一直是空值 | 检查 `routing.rules[0]` 是否为 `{"inboundTag":["api"],"outboundTag":"api"}` —— 该规则**必须在首位**，否则查询会被 `direct-*` 规则截走 |
 | **脚本在「正在检测系统网络配置...」后直接退出提示符**（v1.1.0 及更早） | 已知缺陷（v1.1.1 已修）：`set -e` + 命令替换内 `grep` 链**无匹配**返回 1 ⇒ 静默退出。**无公网 IPv6 的主机必然命中**（只有 `fe80` 链路本地）。<br>**应急热修（两条，已实机验证）**：<br>`sed -i '/^ *ipv4_list=/ s/)$/ \|\| true)/' /root/xray-vless-reality-install.sh`<br>`sed -i '/^ *ipv6_list=/ s/)$/ \|\| true)/' /root/xray-vless-reality-install.sh`<br>然后 `grep -n '_list=' /root/xray-vless-reality-install.sh` 确认两行行尾均带 `\|\| true`、`bash -n` 通过；或直接升级到 v1.1.1 |
-| **NAT 型 VPS（网卡只有私网地址，如 `10.x`/`172.16-31.x`/`192.168.x`）** | 检测到的 IPv4 是**私网地址**：① 「监听IP」务必保持 `0.0.0.0`（填公网 IP 会绑定失败）；② 出口地址选私网地址即可（`sendThrough` 用真实网卡地址，出网经 NAT）；③ 订阅链接里的公网 IP 由 `cloudflare.com/cdn-cgi/trace` 探测，不受影响（v1.1.1 起脚本会在检测阶段主动提示） |
+| **NAT 型 VPS（网卡只有私网地址，如 `10.x`/`172.16-31.x`/`192.168.x`）** | 检测到的 IPv4 是**私网地址**：① 「监听IP」务必保持 `0.0.0.0`（填公网 IP 会绑定失败）；② 出口地址选「使用检测到的地址」（私网即可，出网经 NAT）；③ 订阅链接里的公网 IP 由 `cloudflare.com/cdn-cgi/trace` 探测，不受影响（v1.1.1 起脚本会在检测阶段主动提示） |
+| **节点延迟 `-1` / 能握手但打不开任何网页**（v1.1.1 及更早） | 典型原因是**出站 `sendThrough` 指向了不在网卡上的地址**（例如在 NAT 型 VPS 上把「IPv4 出口」手输成公网 IP）：入口一切正常（443 在听、REALITY 握手成功、日志有 `vless-in` 记录），但每条出站连接在 `bind()` 阶段失败（`Cannot assign requested address`）。<br>**判据**：`python3 -c "import json;print(json.load(open('/var/xray/config.json'))['outbounds'])"` 看 `sendThrough` 是否等于公网 IP；`ip -4 addr show scope global` 看它是否真在网卡上。<br>**修复**：删掉该字段（交回内核自选）或改为网卡上的地址，然后 `xray -test` 预检 + `xray.restart`。v1.1.2 起脚本会在「手动输入出口地址」处直接拦截，并在阶段 19 增加出站源地址自检 |
 
 ## 安全说明
 
@@ -390,6 +391,15 @@ xray.delxray            # 需输入 yes 确认；会停止服务、禁用开机�
 11. 统计**只反映本机 xray 的用量**（不是网卡口径）；与 `vnstat` 等网卡统计对账时请用 `inbound>>>` 键，二者仍会因重传/协议开销存在几个百分点的差异。
 
 ## 变更记录
+
+**v1.1.2（2026-09-21）**
+
+- **修复（严重陷阱，实机复现）：出站 `sendThrough` 指向不在网卡上的地址 ⇒ 节点"能握手但打不开网页、延迟 -1"**
+  - 现象：服务端一切正常（443 在听、REALITY 握手成功、日志有 `vless-in -> direct-ipv4` 记录），但客户端打不开任何网页、测速/测延迟显示 **-1**。
+  - 根因：在 NAT 型 VPS 上把「IPv4 出口」**手动输入为公网 IP**，脚本据此生成 `"sendThrough": "<公网 IP>"`；该地址不在网卡上，出站 dial 在 `bind()` 阶段即失败（`Cannot assign requested address`）。实测：`bind()` 测试 `<公网IP> -> FAIL`、`<私网IP> -> OK`。
+  - 修复：① 「手动输入地址」处新增**在网卡上校验**（`addr_on_this_host`，仅看 `scope global`，排除 `127.0.0.0/8` 与 IPv6 链路本地），不合格会拒绝并要求重新输入；② 阶段 19 新增**出站源地址自检**；③ NAT 检测提示改为明确劝阻手输公网 IP。
+- README 排障表新增「节点延迟 -1 / 能握手打不开网页」条目（含判据与修复步骤，适用于 **v1.1.1 及更早**的既有部署）。
+- 验证：在 sadidc（NAT 型）实测 `addr_on_this_host`：`<私网IP>` → 在网卡上；`<公网IP>`/`127.0.0.1` → 不在；模拟阶段 19 判定结果正确；`bash -n` 通过。
 
 **v1.1.1（2026-09-21）**
 

@@ -1,6 +1,12 @@
 #!/bin/bash
 # ============================================================================
-# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.1.1 (2026-09-21)
+# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.1.2 (2026-09-21)
+# ----------------------------------------------------------------------------
+# v1.1.2 修复（严重陷阱，实机复现）：出站地址允许手输**不在网卡上**的地址
+#   ⇒ outbound 写入 `"sendThrough": <该地址>` ⇒ 出站 dial 在 bind() 阶段失败
+#   （Cannot assign requested address）⇒ 入口一切正常（443 在听、能握手），
+#   但**打不开任何网页**，客户端延迟显示 **-1**。NAT 型 VPS 极易踩到（手输公网 IP）。
+#   现已在「手动输入出口地址」处校验地址是否真在本机网卡上，并在阶段 19 增加出站源地址自检。
 # ----------------------------------------------------------------------------
 # v1.1.1 修复（严重，实机复现）：`set -e` + 命令替换内 grep 链**无匹配**会返回 1，
 #   使脚本在「阶段 1 检测 IP」处**静默退出**（stderr 被 2>/dev/null 丢弃，界面只显示
@@ -71,7 +77,7 @@ if [ -f "$workdir/config.json" ]; then
     [ "$rerun_confirm" = "yes" ] || { echo "已取消"; exit 0; }
 fi
 
-echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.1.1${C_NC}"
+echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.1.2${C_NC}"
 echo ""
 echo "         _      _   __        _                   _ "
 echo "   ___  | |  __| | / _| _ __ (_)  ___  _ __    __| |"
@@ -176,13 +182,27 @@ detect_ips() {
     else
         echo -e "${C_YELLOW}提示：检测到的地址看起来是私网（云厂商 NAT 型 VPS）。此时请务必：${C_NC}"
         echo -e "${C_YELLOW}  · 后续「监听IP」保持默认 0.0.0.0（**不要**填公网 IP——它不在网卡上，绑定会失败）${C_NC}"
-        echo -e "${C_YELLOW}  · 出口地址可选私网地址（sendThrough 用真实网卡地址，出网仍经 NAT）${C_NC}"
+        echo -e "${C_YELLOW}  · 出口地址请选「使用检测到的地址」（私网）；**不要手输公网 IP**——${C_NC}"
+        echo -e "${C_YELLOW}    出站 sendThrough 绑定不存在的地址会失败，现象是「能握手但打不开网页 / 延迟 -1」${C_NC}"
         echo -e "${C_YELLOW}  · 订阅链接里的公网 IP 由 cloudflare 探测得到，不受影响${C_NC}"
     fi
     echo ""
 }
 
 detect_ips
+
+# 判断某地址是否真的在本机网卡上（用于校验出站 sendThrough 的输入）
+# 用法: addr_on_this_host <地址> <4|6>
+addr_on_this_host() {
+    local ip="$1" fam="$2"
+    [ -z "$ip" ] && return 1
+    # 只看 scope global：排除 lo 的 127.0.0.0/8 与 IPv6 链路本地（它们同样不能作为出站源地址）
+    if [ "$fam" = "4" ]; then
+        ip -4 addr show scope global 2>/dev/null | awk '{print $2}' | cut -d/ -f1 | grep -qx "$ip"
+    else
+        ip -6 addr show scope global 2>/dev/null | awk '{print $2}' | cut -d/ -f1 | grep -qix "$ip"
+    fi
+}
 
 # ============================================================
 # 阶段 2：基础变量
@@ -233,7 +253,19 @@ if [ ${#ipv4_addresses[@]} -gt 0 ]; then
                 if [ ${#ipv4_addresses[@]} -eq 1 ]; then ipv4_outbound="${ipv4_addresses[0]}"
                 else select addr in "${ipv4_addresses[@]}"; do ipv4_outbound="$addr"; break; done; fi
                 break;;
-            "手动输入地址") read -rp "地址: " ipv4_outbound; break;;
+            "手动输入地址")
+                # ★ v1.1.2 校验：出站地址必须是**本机网卡上真实存在**的地址。
+                #   否则生成的 outbound 会写 sendThrough=<该地址>，出站 dial 在 bind() 阶段即失败
+                #   （Cannot assign requested address）⇒ 入口能握手、却打不开任何网页，客户端延迟显示 -1。
+                while :; do
+                    read -rp "地址: " ipv4_outbound
+                    [ -z "$ipv4_outbound" ] && break
+                    if addr_on_this_host "$ipv4_outbound" 4; then break; fi
+                    echo -e "${C_RED}该地址不在本机网卡上，不能作为出站地址。${C_NC}"
+                    echo -e "${C_YELLOW}（这会让 sendThrough 绑定失败：节点能握手但打不开网页，客户端延迟显示 -1）${C_NC}"
+                    echo -e "${C_YELLOW}NAT 型 VPS 请选「使用检测到的地址」；留空则取消输入。${C_NC}"
+                done
+                break;;
             "不使用IPv4出口") break;;
         esac
     done
@@ -250,7 +282,16 @@ if [ ${#ipv6_addresses[@]} -gt 0 ]; then
                 if [ ${#ipv6_addresses[@]} -eq 1 ]; then ipv6_outbound="${ipv6_addresses[0]}"
                 else select addr in "${ipv6_addresses[@]}"; do ipv6_outbound="$addr"; break; done; fi
                 break;;
-            "手动输入地址") read -rp "地址: " ipv6_outbound; break;;
+            "手动输入地址")
+                # ★ v1.1.2 校验：同上，IPv6 出站地址也必须是本机网卡上真实存在的地址
+                while :; do
+                    read -rp "地址: " ipv6_outbound
+                    [ -z "$ipv6_outbound" ] && break
+                    if addr_on_this_host "$ipv6_outbound" 6; then break; fi
+                    echo -e "${C_RED}该地址不在本机网卡上，不能作为出站地址（sendThrough 会绑定失败）。${C_NC}"
+                    echo -e "${C_YELLOW}请选「使用检测到的地址」；留空则取消输入。${C_NC}"
+                done
+                break;;
             "不使用IPv6出口") break;;
         esac
     done
@@ -993,6 +1034,31 @@ fi
 if [ "$ddns_enabled" = "yes" ]; then
     systemctl is-active --quiet xray-ddns.timer && echo -e "${C_GREEN}[✓] DDNS 定时器运行中${C_NC}" || { echo -e "${C_RED}[✗] DDNS 定时器未运行${C_NC}"; verify_ok=0; }
 fi
+
+# ★ v1.1.2 新增：出站源地址自检
+#   sendThrough 若指向**不在本机网卡上**的地址，出站 dial 会在 bind() 阶段失败
+#   （Cannot assign requested address）⇒ 入口看起来完全正常（443 在听、能握手），
+#   但打不开任何网页，客户端延迟显示 -1。这是 NAT 型 VPS 最容易踩的坑。
+if [ -z "$ipv4_outbound" ] && [ -z "$ipv6_outbound" ]; then
+    echo -e "${C_GREEN}[✓] 未指定出口地址（由内核自选源地址）${C_NC}"
+else
+    outbound_ok=1
+    if [ -n "$ipv4_outbound" ] && ! addr_on_this_host "$ipv4_outbound" 4; then
+        echo -e "${C_RED}[✗] IPv4 出口地址 $ipv4_outbound 不在本机网卡上 ⇒ 出站必然失败${C_NC}"
+        outbound_ok=0
+    fi
+    if [ -n "$ipv6_outbound" ] && ! addr_on_this_host "$ipv6_outbound" 6; then
+        echo -e "${C_RED}[✗] IPv6 出口地址 $ipv6_outbound 不在本机网卡上 ⇒ 出站必然失败${C_NC}"
+        outbound_ok=0
+    fi
+    if [ "$outbound_ok" = "1" ]; then
+        echo -e "${C_GREEN}[✓] 出口源地址均在本机网卡上${C_NC}"
+    else
+        echo -e "${C_YELLOW}    处置：改 config.json 里 outbounds[].sendThrough 为本机地址，或直接删除该字段后重启${C_NC}"
+        verify_ok=0
+    fi
+fi
+
 if [ "$stats_enabled" = "yes" ]; then
     # 统计是「静默失败」型特性（路由顺序写错时端口在听、查询却不通），故必须实测查询
     ss -tln 2>/dev/null | grep -q ":${apiport}\b" \
