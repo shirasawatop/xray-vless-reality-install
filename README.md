@@ -1,11 +1,11 @@
 # xray-vless-reality-install
 
-> Debian 12/13 上一键部署 Xray 服务端，支持 **REALITY（+ sni-filter）** 与 **VLESS Encryption** 两种形态，带成体系的文件权限模型与一套管理命令。
-> *One-command installer for Xray on Debian: **VLESS over REALITY (with sni-filter)** or **VLESS-Encryption**, with a hardened file-permission model and a full set of management commands.*
+> Debian 12/13 上一键部署 Xray 服务端，支持 **REALITY（sni-filter 可选 + 官方回落限速）** 与 **VLESS Encryption** 两种形态，带成体系的文件权限模型与一套管理命令。
+> *One-command installer for Xray on Debian: **VLESS over REALITY (sni-filter optional + official fallback rate-limit)** or **VLESS-Encryption**, with a hardened file-permission model and a full set of management commands.*
 
 | 项 | 值 |
 |---|---|
-| 当前版本 | **v1.1.4（2026-09-21）** ｜ 安装脚本自身版本 **v1.1.2**（v1.1.4 **移除自检工具 `ipcheck.sh`**（单机脚本无法完成 NAT 形态区分，实用性有限）；公网 IP 归属改为纯手工判据，**安装脚本未变更**） |
+| 当前版本 | **脚本 v1.1.5（2026-10-24）** ｜ 文档 v1.1.5（2026-10-24）。v1.1.5：REALITY 官方回落限速 `limitFallback*`（默认 1 MB/s）、sni-filter 改为**可选**、sni-filter 下载件 **sha256 固定校验**。v1.1.4（文档）：移除自检工具 `ipcheck.sh`（单机脚本无法区分 NAT 形态），公网 IP 归属改为纯手工判据 |
 | 目标系统 | Debian 12 / 13（systemd） |
 | 脚本 | [`xray-vless-reality-install.sh`](./xray-vless-reality-install.sh) |
 | 配套脚本 | [`enable-xray-stats.sh`](./enable-xray-stats.sh) —— 为**既有部署**幂等补装流量统计（可回滚，不重装） |
@@ -21,7 +21,8 @@
 
   | 形态 | 443 监听者 | xray inbound |
   |---|---|---|
-  | **REALITY**（+ sni-filter） | `sni-filter`（用户态） | unix socket `socket/xray.friend,0600`，`security=reality` |
+  | **REALITY**（+ sni-filter） | `sni-filter`（用户态） | unix socket `socket/xray.friend,0600`，`security=reality` + `limitFallback*` |
+  | **REALITY**（无 sni-filter） | `xray` 本体 | `port:<你的端口>`，`security=reality` + `limitFallback*` |
   | **VLESS Encryption** | `xray` 本体 | `port:<你的端口>`，`security=none` + `decryption=mlkem768x25519plus…` |
 
 - **交互式**：全程问答（若装了 `whiptail` 则以对话框菜单呈现），无需手改 JSON。
@@ -33,13 +34,49 @@
 - **流量统计（v1.1.0，安装时询问 / 默认开启）**：生成 `stats` + `api(StatsService)` + `policy`（用户级与入站级计数）、api 入站（**仅监听 `127.0.0.1:<apiport>`，默认 10085**，公网不可达）、主入站 `tag`（默认 `vless-in`）与首个客户端 `email`（默认 `client-1`）—— 之后用 `xray.stats` 即可查看用量。**关闭该项则完全不生成相关配置**（与 v1.0.4 等价）。
 - **API 路由规则置于 `routing.rules` 首位**（不变量）：脚本生成的 `direct-ipv4/ipv6` 规则**不限定入站**，若 api 规则排在其后会被截走 ⇒ 统计**静默失效**；故安装收尾会**实测** `statsquery`（端口在听 ≠ 查询可用）。
 
+### 防偷流量：两个开关（v1.1.5）
+
+REALITY 的“回落”是协议设计的一部分：任何**未通过认证**的连接都会被原样转给 `dest`。若 `dest` 是**共享边缘/CDN**（例如某个由共享托管边缘承载的公共站点，如 Pantheon/Fastly），任何人都能借你的 IP 当中继白嫖带宽（实测：陌生 SNI 经本机 443 + `Host: <该站点域名>` 可直接取回其首页 200）。两个开关互不冲突：
+
+| 开关 | 机制 | 能防什么 | 代价 |
+|---|---|---|---|
+| **回落限速**（默认开，1 MB/s） | 官方 `limitFallbackUpload/Download` | 白嫖带宽被掐死（实测 223 MB/s → 215 KB/s） | 陌生回访变慢；**不阻断**，只是不划算 |
+| **sni-filter**（默认保留） | 443 前 SNI 白名单门，非白名单 **EOF** | 陌生 SNI 零字节外送（最彻底） | “握手期静默断开”可被指纹化；多一个第三方二进制 |
+
+> 限速语义（实测）：`bytesPerSec` 是**稳态**速率，`burstBytesPerSec` 是突发桶（脚本默认取 2 倍）。
+> 故 8 MiB 下载的**平均值**会高于 1 MB/s：实测 1 MB/s+2×burst → 0.82～1.39 MB/s（10.1s / 6.0s）；
+> 200 KB/s+2×burst → 0.19 MB/s（44s）；完全不限速时同环境 120～161 MB/s。
+> 要“硬顶”就把 burst 设成与 `bytesPerSec` 相等。
+
+两形态的实测差异（某严格白名单主机，同机同 dest，外部探测 `openssl s_client -servername X`）：
+
+| 形态 | 陌生 SNI（`example.org`） | 匹配 SNI（`<伪装域名>`） |
+|---|---|---|
+| sni-filter 开启 | **1 秒内 EOF**，无证书 | TLS1.3，`CN=<该站点证书>`，Verify 0 |
+| sni-filter 关闭 | **握手成功，`CN=pantheonsite.io`**（共享边缘默认证书）⇒ 任何人都可借道 | 同上 |
+
+- **推荐叠加**：sni-filter 挡陌生 SNI，回落限速补「白名单 SNI 仍会回落」这个漏。
+- 想要最自然的外观：关掉 sni-filter，让陌生 SNI 也正常回落到真站，防盗只靠限速。
+- 想从根上消除中继：把 `dest` 换成**独立主机**（陌生 SNI 直接失败），比两个开关都值。
+
+### 部署前必看：防火墙不会自动放行
+
+本脚本**不修改防火墙**。若目标机的 `inet filter input` 是 `policy drop`（严格白名单，本机队就是这么配的），
+443 会被直接丢弃 —— 安装过程 9 项自检全绿、`ss` 也能看到监听，但**外部完全连不上**（实测踩到）。
+v1.1.5 起阶段 19 会检测到这种组合并打印提醒。手动放行：
+
+```bash
+nft insert rule inet filter input tcp dport 443 counter accept   # 临时验证
+# 持久化：在 /etc/nftables.conf 的 input 链内加一行
+```
+
 ## 环境要求
 
 | 项 | 要求 |
 |---|---|
 | 系统 | Debian 12 / 13，systemd 可用（其它发行版未验证） |
 | 权限 | **root**（需写 `/etc/systemd/system`、创建系统用户、绑定 443） |
-| 依赖 | `wget`、`openssl`、`unzip`（脚本会检查并给出安装命令） |
+| 依赖 | `wget`、`openssl`、`unzip`、`sha256sum`（coreutils，用于校验 sni-filter 下载件） |
 | 网络 | 可访问 `github.com`（下载 Xray 与 sni-filter）与 `cloudflare.com`（探测公网 IP） |
 | 架构 | `x86_64` / `i686` / `aarch64` |
 
@@ -70,6 +107,8 @@ bash /root/xray-vless-reality-install.sh
 | 6 | 监听 IP / 端口 | `0.0.0.0` / `443` | 443 需 `CAP_NET_BIND_SERVICE`（脚本已处理） |
 | 6a | **REALITY 专属**：伪装域名 | **`www.fastly.com`** | 需**支持 TLS1.3** 的境外站点，常用 **`tesla.com`**；`dest=域名:443`、`serverNames=[域名]`（选法见「例 1」下方） |
 | 6b | **REALITY 专属**：指纹 `fp` | `chrome` | 可选 chrome / firefox / safari / ios / edge |
+| 6b-1 | **REALITY 专属**：回落限速 | `Y` / **1 MB/s** | 写 `limitFallbackUpload/Download`（官方）。档位 `1`=1 MB/s、`2`=200 KB/s、`3`=自定义（KB/s）；`n` → 不生成（回到 v1.1.2 行为）。取舍见下「防偷流量」 |
+| 6b-2 | **REALITY 专属**：是否保留 sni-filter | `Y` | `Y` → 443 归 `sni-filter`（陌生 SNI 立即 EOF）；`n` → `xray` 直听，陌生 SNI 按 REALITY 设计回落到 `dest` |
 | 6c | **Encryption 专属**：密钥模式 | `mlkem768` | `mlkem768`（抗量子，推荐）/ `x25519`（传统） |
 | 6d | **Encryption 专属**：外观 | `native` | `native` / `xorpub` / `random`（越靠后越隐蔽） |
 | 6e | **Encryption 专属**：RTT | `0rtt` | `0rtt`（更快）/ `1rtt`（更安全） |
@@ -226,8 +265,8 @@ bash /root/xray.sh
 | 文件 / 目录 | 权限 | 属主 | 说明 |
 |---|---|---|---|
 | `xray` | `755` | `root:root` | Xray 本体（**服务账户不可写**，只可执行） |
-| `sni-filter` | `755` | `root:root` | 仅 REALITY 形态（443 的实际监听者） |
-| `xrayinit` | `755` | `root:root` | 启动脚本（拉起 sni-filter 与 xray） |
+| `sni-filter` | `755` | `root:root` | **仅「REALITY + sni-filter」**（443 的实际监听者）；关该开关则不下载、不安装 |
+| `xrayinit` | `755` | `root:root` | 启动脚本（有 sni-filter 时先拉起它，否则只拉起 xray） |
 | `config.json` | `640` | `root:xrayuser` | 服务配置；服务账户经 group 位读取 |
 | `uuid.txt` | `600` | `root:root` | 当前客户端 UUID（供 `xray.chaguuid` 使用） |
 | `encryption_key.txt` | `600` | `root:root` | 仅 Encryption 形态 |
@@ -347,7 +386,7 @@ vless://<uuid>@<ip>:<port>?encryption=<encryption_str>&flow=xtls-rprx-vision&sec
 ```bash
 # 服务与端口
 systemctl status xray_service --no-pager
-ss -tlnp | grep ':443\b'          # REALITY: 属主是 sni-filter；Encryption: 属主是 xray
+ss -tlnp | grep ':443\b'          # REALITY+sni-filter: 属主是 sni-filter；其余两种: 属主是 xray
 pgrep -a 'xray|sni-filter'
 journalctl -u xray_service -n 50 --no-pager
 
@@ -370,7 +409,7 @@ systemctl list-timers xray-ddns.timer 2>/dev/null || echo "未启用 DDNS"
 |---|---|
 | 提示缺少 `unzip`/`wget`/`openssl` | 按提示 `apt-get install -y …` 后重跑 |
 | 端口未监听 | `journalctl -u xray_service -n 50`；确认端口未被占用（`ss -tlnp \| grep :443`） |
-| REALITY 形态看不到 `xray` 监听 443 | **正常**：443 由 `sni-filter` 监听，xray 走 unix socket |
+| 「REALITY + sni-filter」看不到 `xray` 监听 443 | **正常**：443 由 `sni-filter` 监听，xray 走 unix socket（关掉 sni-filter 时 443 归 xray 本体） |
 | 客户端连不上 | 核对链接里的 `uuid`、`sni/host`、`pbk`、`sid`、`fp` 是否与安装输出一致；确认客户端时间准确 |
 | 重跑安装脚本后客户端全失效 | 预期行为：重跑会**重新生成密钥与 UUID**（脚本已二次确认）；请用新链接更新客户端 |
 | `xray.stats` 报 `failed to dial 127.0.0.1:10085` | 统计未启用或端口被改：`ss -tlnp \| grep 10085`；核对 `config.json` 的 api 入站端口与查询命令是否一致 |
@@ -402,7 +441,7 @@ xray.delxray            # 需输入 yes 确认；会停止服务、禁用开机�
 | 组件 | 来源 | 用途 |
 |---|---|---|
 | Xray-core **v26.3.27** | `github.com/XTLS/Xray-core` releases | 服务端本体（三个架构分支） |
-| realtime sni-filter **v0.2** | `github.com/shirasawatop/REALITY-sni-filter` releases —— **本项目 fork，上游 [oldfriendme/REALITY-sni-filter](https://github.com/oldfriendme/REALITY-sni-filter)（MIT）** | **仅 REALITY 形态**：443 监听者 |
+| realtime sni-filter **v0.2** | `github.com/shirasawatop/REALITY-sni-filter` releases —— **本项目 fork，上游 [oldfriendme/REALITY-sni-filter](https://github.com/oldfriendme/REALITY-sni-filter)（MIT）** | **仅「REALITY + sni-filter」**：443 监听者；下载件按脚本内 `SNI_FILTER_ZIP_SHA256` 做 sha256 固定校验 |
 | `cloudflare.com/cdn-cgi/trace` | Cloudflare | 探测公网 IPv4 / IPv6 |
 
 ## 已知限制
@@ -454,7 +493,7 @@ xray.delxray            # 需输入 yes 确认；会停止服务、禁用开机�
 
 - **修复（严重，实机复现）：脚本在「阶段 1 检测 IP」处静默退出** —— 现象为界面打印 `正在检测系统网络配置...` 后**直接回到提示符**，无任何报错。
   - 根因：`set -e` 与「命令替换内以 `grep` 结尾的管道」组合 —— 无匹配时最后一条 `grep` 返回 1 ⇒ 整条赋值失败 ⇒ 脚本退出；且该命令的 `stderr` 已被 `2>/dev/null` 丢弃，故**完全静默**。
-  - 触发条件：**主机没有公网 IPv6**（`eth0` 仅有 `fe80::/64` 链路本地）时，IPv6 检测分支必然命中。实测：NAT 型 VPS `sadidc` 必现，而带公网 IPv6 的 `lycheen` 不现。
+  >  - 触发条件：**主机没有公网 IPv6**（`eth0` 仅有 `fe80::/64` 链路本地）时，IPv6 检测分支必然命中。实测：EIP / 1:1 NAT 型 VPS（网卡只有私网地址）必现，而带公网 IPv6 的主机不现。
   - 修复：IPv4/IPv6 检测的命令替换末尾加 `|| true`；`xray mlkem768` 的 `Seed:`/`Client:` 解析同步改为 `sed` 宽松解析（原 `grep` 同样会静默退出）。
 - **新增：NAT 型 VPS 提示** —— 检测到的地址为私网（`10./172.16-31./192.168.`）时，主动提示：① 「监听IP」保持 `0.0.0.0`（填公网 IP 会绑定失败）；② 出口可选私网地址（`sendThrough` 用真实网卡地址，出网经 NAT）；③ 订阅链接的公网 IP 由 Cloudflare 探测，不受影响。
 - README 排障表新增上述两条（含旧版本**应急热修**命令）；无其它行为变更。

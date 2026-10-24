@@ -327,13 +327,21 @@ if not proto:
 if proto == "reality":
     xt = open(os.path.join(wd, "xrayinit")).read()
     m = re.search(r"tcp://([^\s]+)", xt)
-    if not m: sys.exit("无法从 xrayinit 解析 sni-filter 监听地址")
-    hp = m.group(1)
-    if hp.startswith("["):
-        host, port = hp[1:].split("]:")[0], int(hp.rsplit("]:", 1)[1])
+    if m:
+        hp = m.group(1)
+        if hp.startswith("["):
+            host, port = hp[1:].split("]:")[0], int(hp.rsplit("]:", 1)[1])
+        else:
+            host, port = hp.rsplit(":", 1)[0], int(hp.rsplit(":", 1)[1])
+        if host in ("0.0.0.0", "::"): host = "127.0.0.1"
     else:
-        host, port = hp.rsplit(":", 1)[0], int(hp.rsplit(":", 1)[1])
-    if host in ("0.0.0.0", "::"): host = "127.0.0.1"
+        # v1.1.5 起 sni-filter 可选：无 sni-filter 形态下 443 由 xray 本体直听
+        # ⇒ 监听地址直接取自 inbound（port/listen），不再依赖 xrayinit
+        if "port" not in main:
+            sys.exit("REALITY 形态但 xrayinit 无 sni-filter、inbound 也无 port，无法确定监听地址")
+        port = int(main["port"])
+        host = main.get("listen") or "127.0.0.1"
+        if host in ("0.0.0.0", "::", "[::]"): host = "127.0.0.1"
     rs = ss["realitySettings"]
     r = subprocess.run([xray, "x25519", "-i", rs["privateKey"]], capture_output=True, text=True)
     # 标签兼容：Xray 26.3.27 输出为 "Password (PublicKey): xxx"（旧版为 "Password: xxx"）

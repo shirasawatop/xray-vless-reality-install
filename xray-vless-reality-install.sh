@@ -1,6 +1,22 @@
 #!/bin/bash
 # ============================================================================
-# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.1.2 (2026-09-21)
+# Xray VLESS 二合一部署脚本：REALITY / VLESS Encryption        v1.1.5 (2026-10-24)
+# ----------------------------------------------------------------------------
+# v1.1.5 变更（2026-10-24）："防偷流量"两个层次可叠加，不再是二选一
+#   1. REALITY 新增**官方回落限速** limitFallbackUpload/limitFallbackDownload
+#      （阶段 6b-1 询问，默认启用，默认 1 MB/s、burst 2 MB/s）。
+#      背景：REALITY 的"回落"是协议设计的一部分（否则会被主动探测识别），
+#      任何未通过认证的连接都会被原样转给 dest。dest 若是**共享边缘/CDN**
+#      （如某公共站点由 Pantheon/Fastly 承载），任何人都能借本机 IP 当中继白嫖带宽。
+#      限速不改变外观（仍像真站），只是让白嫖失去意义（实测 223 MB/s → 215 KB/s）。
+#   2. sni-filter 改为**可选**（阶段 6b-2 询问，默认保留）：
+#      · 保留 = 443 由 sni-filter 监听、xray 走 unix socket；非白名单 SNI 立即 EOF
+#        （陌生 SNI 零字节外送，防偷最彻底；代价是"握手期静默断开"可被指纹化）
+#      · 关闭 = xray 本体直听 443；陌生 SNI 按 REALITY 设计回落到 dest
+#        （外观最自然，防盗完全依赖上面的 limitFallback*）
+#      两者可同时启用：sni-filter 挡陌生 SNI，limitFallback* 补"白名单 SNI 仍回落"这个漏。
+#   3. sni-filter 下载件增加 **sha256 固定校验**（SNI_FILTER_ZIP_SHA256）：
+#      上游 release 一旦变更即中止安装（避免"每次都取最新二进制"的供应链风险）。
 # ----------------------------------------------------------------------------
 # v1.1.2 修复（严重陷阱，实机复现）：出站地址允许手输**不在网卡上**的地址
 #   ⇒ outbound 写入 `"sendThrough": <该地址>` ⇒ 出站 dial 在 bind() 阶段失败
@@ -15,7 +31,7 @@
 #   附：新增 NAT 型 VPS 提示（网卡只有私网地址时，提醒「监听IP 保持 0.0.0.0」）。
 # ----------------------------------------------------------------------------
 # 功能：交互式部署 Xray 服务端，二选一：
-#   ① REALITY（+ sni-filter：443 由 sni-filter 监听，xray 走 unix socket）
+#   ① REALITY（+ 可选 sni-filter：开启时 443 由 sni-filter 监听、xray 走 unix socket；关闭时 xray 直听 443）
 #   ② VLESS Encryption（xray 本体监听 443）
 #   部署后生成管理命令：xray.chaguuid / start / stop / restart / status / log / stats / help / delxray
 #
@@ -60,7 +76,8 @@ fi
 workdir=/var/xray
 
 missing_deps=()
-for cmd in wget openssl unzip; do
+# sha256sum：v1.1.5 起用于校验 sni-filter 下载件（coreutils 自带，列出来让缺失可见）
+for cmd in wget openssl unzip sha256sum; do
     command -v "$cmd" &>/dev/null || missing_deps+=("$cmd")
 done
 if [ ${#missing_deps[@]} -gt 0 ]; then
@@ -77,7 +94,7 @@ if [ -f "$workdir/config.json" ]; then
     [ "$rerun_confirm" = "yes" ] || { echo "已取消"; exit 0; }
 fi
 
-echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.1.2${C_NC}"
+echo -e "${C_GREEN}欢迎使用 REALITY / VLESS Encryption 二合一脚本 v1.1.5${C_NC}"
 echo ""
 echo "         _      _   __        _                   _ "
 echo "   ___  | |  __| | / _| _ __ (_)  ___  _ __    __| |"
@@ -215,6 +232,20 @@ mtu_enabled="no"; mtu_interface="eth0"; mtu_value="1390"
 
 # REALITY 特有变量
 domain_s="www.fastly.com"
+
+# 防偷流量相关（v1.1.5；阶段 6b-1 / 6b-2 询问）
+sni_filter_enabled="yes"      # 是否启用 sni-filter（SNI 白名单门）：yes=443 归 sni-filter，no=xray 直听
+fallback_limit_enabled="yes"  # 是否启用官方回落限速（limitFallbackUpload/Download）
+fallback_kbps=1024            # 回落限速（KB/s）：1024=1 MB/s（默认），200=更严
+
+# sni-filter release 的固定校验值（供应链校验，2026-10-24 实测）
+#   上游 release 变更后此值必然失配 ⇒ 安装中止。更新流程：
+#     1) 人工下载 autobuild.zip；2) sha256sum 核对；3) 逐架构核对二进制；
+#     4) 更新本常量与下方注释里的三份 hash；5) 在测试机实跑一次再合并。
+#   autobuild.zip   b769e1ce5ae4a6872e166d56453e67b1f30eeccfec9d1eb73e435c34923e3ffb  (2636701 B)
+#     sni-filter-amd64 623120a18648f1f8…   sni-filter-arm64 dd442ba8d44626be…
+#     sni-filter-i386  5002cda4faa4bbb4…
+SNI_FILTER_ZIP_SHA256="b769e1ce5ae4a6872e166d56453e67b1f30eeccfec9d1eb73e435c34923e3ffb"
 
 # VLESS Encryption 特有变量
 vless_key_mode="mlkem768"
@@ -386,7 +417,50 @@ if [ "$protocol" = "reality" ]; then
         case "$c" in 2) fingerprint="firefox";; 3) fingerprint="safari";; 4) fingerprint="ios";; 5) fingerprint="edge";; esac
     fi
 
+    # ---- 6b-1：官方回落限速（limitFallback*）----
+    echo ""
+    echo -e "${C_YELLOW}REALITY 的“回落”是协议设计的一部分：未通过认证的连接会被原样转给 dest（真站）。${C_NC}"
+    echo -e "${C_YELLOW}若 dest 是共享边缘/CDN（如某公共站点由 Pantheon+Fastly 承载），${C_NC}"
+    echo -e "${C_YELLOW}任何人都能借本机 IP 当中继白嫖带宽（= 被偷流量）。${C_NC}"
+    if command -v whiptail &>/dev/null; then
+        if ! whiptail --yesno "是否启用官方回落限速（limitFallbackUpload/Download）？\n\n· 保留“任何 SNI 都像真站”的自然外观\n· 把被白嫖的带宽掐死（真人回访基本无感；实测 223 MB/s → 215 KB/s）" 14 70; then
+            fallback_limit_enabled="no"
+        fi
+    else
+        read -rp "是否启用官方回落限速 limitFallback*？(Y/n): " c
+        case "$c" in n|N) fallback_limit_enabled="no";; esac
+    fi
+
+    if [ "$fallback_limit_enabled" = "yes" ]; then
+        echo "回落限速档位: 1) 1 MB/s（推荐，默认） 2) 200 KB/s（更严） 3) 自定义"
+        read -rp "选择 (默认 1): " c
+        case "$c" in
+            2) fallback_kbps=200;;
+            3) read -rp "自定义限速 (KB/s，例如 512): " fb
+               case "$fb" in
+                   ''|*[!0-9]*) echo -e "${C_YELLOW}无效值，回落默认 1024 KB/s${C_NC}";;
+                   *) fallback_kbps="$fb";;
+               esac;;
+            *) fallback_kbps=1024;;
+        esac
+    fi
+
+    # ---- 6b-2：sni-filter 取舍 ----
+    echo ""
+    echo -e "${C_YELLOW}sni-filter = 443 前的 SNI 白名单门：非白名单 SNI 直接 EOF。${C_NC}"
+    echo "  · 保留：陌生 SNI 零字节外送（防偷最彻底）；代价是“握手期静默断开”可被指纹化"
+    echo "  · 关闭：陌生 SNI 也按 REALITY 设计回落到 dest（外观最自然），防盗只靠上面的限速"
+    if command -v whiptail &>/dev/null; then
+        if ! whiptail --yesno "是否保留 sni-filter（SNI 白名单门）？\n\n默认保留：与回落限速叠加，可覆盖“白名单 SNI 仍回落”这个漏。" 13 70; then
+            sni_filter_enabled="no"
+        fi
+    else
+        read -rp "是否保留 sni-filter？(Y/n): " c
+        case "$c" in n|N) sni_filter_enabled="no";; esac
+    fi
+
     echo "配置: $ipaddr:$portx?sni=$domain_s&fp=$fingerprint"
+    echo "防偷流量: 回落限速=$([ "$fallback_limit_enabled" = "yes" ] && echo "${fallback_kbps} KB/s" || echo "关闭") | sni-filter=$([ "$sni_filter_enabled" = "yes" ] && echo "保留" || echo "关闭")"
 else
     echo ""
     echo -e "${C_YELLOW}╔══════════════════════════════════════════════════╗${C_NC}"
@@ -648,11 +722,29 @@ if [ "$stats_enabled" = "yes" ]; then
 fi
 
 if [ "$protocol" = "reality" ]; then
+    # v1.1.5：sni-filter 关闭时由 xray 本体直听（443 归 xray，不再经过 SNI 门）
+    if [ "$sni_filter_enabled" = "yes" ]; then
+        reality_port_line=""
+        reality_listen_line="\"listen\": \"${workdir}/socket/xray.friend,0600\","
+    else
+        reality_port_line="\"port\": $portx,"
+        reality_listen_line="\"listen\": \"$ipaddr\","
+    fi
+    # v1.1.5：官方回落限速（afterBytes=0 ⇒ 立即限速；burst 取 2 倍）
+    fallback_block=""
+    if [ "$fallback_limit_enabled" = "yes" ]; then
+        fb_rate=$((fallback_kbps * 1024))
+        fb_burst=$((fb_rate * 2))
+        fallback_block=",
+            \"limitFallbackUpload\": {\"afterBytes\": 0, \"bytesPerSec\": $fb_rate, \"burstBytesPerSec\": $fb_burst},
+            \"limitFallbackDownload\": {\"afterBytes\": 0, \"bytesPerSec\": $fb_rate, \"burstBytesPerSec\": $fb_burst}"
+    fi
     cat > config.json <<EOF
 {"log": {"loglevel": "warning"}$stats_top,
   "inbounds": [{
     $stats_tag_line
-    "listen": "${workdir}/socket/xray.friend,0600",
+    $reality_port_line
+    $reality_listen_line
     "protocol": "vless",
     "settings": {
         "clients": [{"id": "$id_s","flow": "xtls-rprx-vision"$stats_email_field}],
@@ -665,7 +757,7 @@ if [ "$protocol" = "reality" ]; then
             "dest": "$domain_s:443",
             "serverNames": ["$domain_s"],
             "privateKey": "$private_old",
-            "shortIds": ["$shortIds"]
+            "shortIds": ["$shortIds"]$fallback_block
         }
     }
 }$stats_api_inbound],
@@ -708,9 +800,28 @@ chown root:root $workdir/xray
 # ============================================================
 # 阶段 13：SNI Filter（仅 REALITY 需要）
 # ============================================================
-if [ "$protocol" = "reality" ]; then
+if [ "$protocol" = "reality" ] && [ "$sni_filter_enabled" = "yes" ]; then
+    # 依赖自检：sha256sum 用于下方校验（coreutils 自带，缺失时明确报错而非静默跳过）
+    command -v sha256sum >/dev/null 2>&1 || { echo -e "${C_RED}[✗] 缺少 sha256sum（coreutils），无法校验 sni-filter${C_NC}"; exit 1; }
     # sni-filter 来源：本项目 fork 自 oldfriendme/REALITY-sni-filter（MIT），此处取 fork 的 release 产物
     wget -q https://github.com/shirasawatop/REALITY-sni-filter/releases/download/v0.2/autobuild.zip -O autobuild.zip
+
+    # ★ v1.1.5：sha256 固定校验（供应链）。验的是整个 autobuild.zip：
+    #   一个常量覆盖三架构，且解开前后都不依赖“latest”语义。
+    #   上游 release 变更 ⇒ 必然失配 ⇒ 中止安装。更新方式见阶段 2 常量处的注释。
+    actual_zip_sha=$(sha256sum autobuild.zip | awk '{print $1}')
+    if [ "$actual_zip_sha" != "$SNI_FILTER_ZIP_SHA256" ]; then
+        echo -e "${C_RED}[✗] sni-filter 下载件校验失败，安装中止${C_NC}"
+        echo "  期望: $SNI_FILTER_ZIP_SHA256"
+        echo "  实际: $actual_zip_sha"
+        echo ""
+        echo "  ⇒ 上游 release 可能已更新。请人工核对源码/构建产物后再更新脚本常量，"
+        echo "    不要直接跳过校验（这会重新打开“每次都取最新二进制”的供应链风险）。"
+        rm -f autobuild.zip
+        exit 1
+    fi
+    echo -e "${C_GREEN}[✓] sni-filter 校验通过（sha256 与脚本常量一致）${C_NC}"
+
     unzip -o autobuild.zip -d . && rm autobuild.zip
     case $arch in
         x86_64) mv sni-filter-amd64 sni-filter;;
@@ -726,6 +837,14 @@ if [ "$protocol" = "reality" ]; then
     chown root:root sni-filter
     # 不再依赖 setcap，权限由 systemd AmbientCapabilities 提供
     echo "SNI Filter 已安装"
+elif [ "$protocol" = "reality" ]; then
+    # 从「有 sni-filter」形态重装过来时，旧二进制与 pid 会留在 workdir（本形态不加载它）：
+    #   · 审计歧义（“到底在跑哪个二进制”）；· unit 的 ExecStartPre 会凭 -e 继续造 pid。
+    if [ -e "$workdir/sni-filter" ] || [ -e "$workdir/sni-filter.pid" ]; then
+        echo -e "${C_YELLOW}检测到上次部署遗留的 sni-filter 二进制/pid，已清除（本形态不使用）${C_NC}"
+        rm -f "$workdir/sni-filter" "$workdir/sni-filter.pid"
+    fi
+    echo "已选择不使用 sni-filter：xray 本体直听端口，陌生 SNI 按 REALITY 设计回落到 dest"
 else
     echo "VLESS Encryption 模式，跳过 SNI Filter 安装"
 fi
@@ -733,7 +852,7 @@ fi
 # ============================================================
 # 阶段 14：生成 xrayinit（启动脚本）
 # ============================================================
-if [ "$protocol" = "reality" ]; then
+if [ "$protocol" = "reality" ] && [ "$sni_filter_enabled" = "yes" ]; then
     cat > xrayinit << LAUNCHER
 #!/bin/bash
 setsid $workdir/sni-filter -L=tcp://${ipaddr}:${portx} -F=unix://${workdir}/socket/xray.friend -S=$domain_s &
@@ -743,6 +862,7 @@ echo \$! > ${workdir}/xray.pid
 echo "on" > $workdir/statusfilter
 LAUNCHER
 else
+    # 加密形态 / REALITY（无 sni-filter）：xray 本体直接监听端口
     cat > xrayinit << LAUNCHER
 #!/bin/bash
 setsid $workdir/xray -c $workdir/config.json &
@@ -841,7 +961,15 @@ EOF
 mtu_line=""
 [ "$mtu_enabled" = "yes" ] && mtu_line="ExecStartPre=+/usr/sbin/ip link set dev $mtu_interface mtu $mtu_value"
 
-proto_label="$([ "$protocol" = "reality" ] && echo "REALITY" || echo "VLESS Encryption")"
+if [ "$protocol" = "reality" ]; then
+    if [ "$sni_filter_enabled" = "yes" ]; then
+        proto_label="REALITY + sni-filter"
+    else
+        proto_label="REALITY（xray 直听）"
+    fi
+else
+    proto_label="VLESS Encryption"
+fi
 
 cat > /etc/systemd/system/xray_service.service << EOF
 [Unit]
@@ -912,6 +1040,9 @@ cat > delxray << EOF
 read -rp "将停止服务并删除 $workdir 与 xrayuser，输入 yes 确认卸载: " del_confirm
 [ "\$del_confirm" = "yes" ] || { echo "已取消"; exit 0; }
 systemctl stop xray_service; systemctl disable xray_service
+# v1.1.5：disable 只摘 symlink，unit 文件仍在（实测）⇒ 一并删除，否则“卸载完”仍会留下可用单元
+rm -f /etc/systemd/system/xray_service.service
+systemctl daemon-reload
 kill \$(cat $workdir/xray.pid) 2>/dev/null
 [ -f $workdir/sni-filter.pid ] && kill \$(cat $workdir/sni-filter.pid) 2>/dev/null
 deluser xrayuser 2>/dev/null
@@ -946,9 +1077,16 @@ echo "xray.log      查看日志"
 ${stats_help_line}
 echo "xray.help     帮助"
 echo "========================================"
+echo "防偷流量: 回落限速=$([ "$fallback_limit_enabled" = "yes" ] && echo "${fallback_kbps} KB/s" || echo "关闭") | sni-filter=$([ "$sni_filter_enabled" = "yes" ] && echo "保留" || echo "关闭")"
 EOF
 
 # status
+# v1.1.5：sni-filter 行按形态生成（无 sni-filter 时不输出误导性的“未运行”）
+if [ "$protocol" = "reality" ] && [ "$sni_filter_enabled" = "yes" ]; then
+    sni_status_line='pgrep -la sni-filter 2>/dev/null || echo "sni-filter 未运行"'
+else
+    sni_status_line=''
+fi
 cat > xraystatus << EOF
 #!/bin/bash
 systemctl status xray_service --no-pager
@@ -956,7 +1094,7 @@ echo ""; echo "--- 端口监听 ---"
 ss -tlnp 2>/dev/null | grep -E ':(${portx})\b' || echo "未检测到 ${portx} 端口监听"
 echo ""; echo "--- 进程 ---"
 pgrep -la xray 2>/dev/null || echo "xray 未运行"
-pgrep -la sni-filter 2>/dev/null || echo "sni-filter 未运行"
+${sni_status_line}
 EOF
 
 # log
@@ -1028,9 +1166,29 @@ verify_ok=1
 systemctl is-active --quiet xray_service && echo -e "${C_GREEN}[✓] systemd 服务运行中${C_NC}" || { echo -e "${C_RED}[✗] systemd 服务未运行${C_NC}"; verify_ok=0; }
 ss -tlnp 2>/dev/null | grep -q ":${portx}\b" && echo -e "${C_GREEN}[✓] 端口 ${portx} 已监听${C_NC}" || { echo -e "${C_RED}[✗] 端口 ${portx} 未监听${C_NC}"; verify_ok=0; }
 pgrep -f "$workdir/xray" >/dev/null 2>&1 && echo -e "${C_GREEN}[✓] xray 进程运行中${C_NC}" || { echo -e "${C_RED}[✗] xray 进程未运行${C_NC}"; verify_ok=0; }
-if [ "$protocol" = "reality" ]; then
+if [ "$protocol" = "reality" ] && [ "$sni_filter_enabled" = "yes" ]; then
     pgrep -f "$workdir/sni-filter" >/dev/null 2>&1 && echo -e "${C_GREEN}[✓] sni-filter 进程运行中${C_NC}" || { echo -e "${C_RED}[✗] sni-filter 进程未运行${C_NC}"; verify_ok=0; }
 fi
+# v1.1.5：防火墙放行提醒（本脚本不改防火墙；严格白名单机器上 443 常被 policy drop 挡住，
+#   现象是“安装全绿、外部连不上”——实测踩到）
+if command -v nft >/dev/null 2>&1; then
+    if nft list chain inet filter input 2>/dev/null | grep -q 'policy drop' \
+       && ! nft -s list chain inet filter input 2>/dev/null | grep -qE 'dport ?443'; then
+        echo -e "${C_YELLOW}[!] nftables input 为 policy drop，且未见 443 放行规则${C_NC}"
+        echo "    本脚本不修改防火墙。临时验证： nft insert rule inet filter input tcp dport 443 accept"
+        echo "    持久化：在 /etc/nftables.conf 的 input 链加 tcp dport 443 counter accept"
+    fi
+fi
+
+# v1.1.5：回落限速写入自检（静默失败型：字段拼错时 xray 仍能启动）
+if [ "$protocol" = "reality" ] && [ "$fallback_limit_enabled" = "yes" ]; then
+    if grep -q '"limitFallbackUpload"' $workdir/config.json 2>/dev/null; then
+        echo -e "${C_GREEN}[✓] 回落限速已写入（${fallback_kbps} KB/s，burst 2 倍）${C_NC}"
+    else
+        echo -e "${C_RED}[✗] 回落限速字段缺失（limitFallbackUpload）${C_NC}"; verify_ok=0
+    fi
+fi
+
 if [ "$ddns_enabled" = "yes" ]; then
     systemctl is-active --quiet xray-ddns.timer && echo -e "${C_GREEN}[✓] DDNS 定时器运行中${C_NC}" || { echo -e "${C_RED}[✗] DDNS 定时器未运行${C_NC}"; verify_ok=0; }
 fi
